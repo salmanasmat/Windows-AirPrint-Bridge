@@ -65,7 +65,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION: str = "1.1.1"
+VERSION: str = "1.3.0"
 IPP_PORT: int = 631
 IPP_SERVICE_TYPE: str = "_ipp._tcp.local."
 
@@ -324,16 +324,37 @@ def get_default_printer() -> str:
     return name
 
 
-def spool_to_printer(file_path: str, printer_name: str) -> None:
+def spool_to_printer(
+    file_path: str,
+    printer_name: str,
+    media_size_mm: Optional[Tuple[float, float]] = None,
+) -> None:
     """
     Send *file_path* to the Windows print queue of *printer_name*.
-    
+
     Uses PyMuPDF to rasterize the PDF and win32ui to send it directly
     to the printer's Device Context (DC). This bypasses the need for
     unreliable ShellExecute headless verbs on Windows 10/11.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the PDF (or image) file to print.
+    printer_name : str
+        Windows printer queue name.
+    media_size_mm : tuple of (width_mm, height_mm), optional
+        Physical paper size requested by the client (from the IPP
+        ``media`` attribute).  When provided, the printer DC's DEVMODE
+        is configured to match so that ``HORZRES`` / ``VERTRES``
+        reflect the correct imageable area.
     """
     logger.info("Spooling '%s' to printer '%s'", file_path, printer_name)
-    
+    if media_size_mm:
+        logger.info(
+            "Requested media size: %.1f × %.1f mm",
+            media_size_mm[0], media_size_mm[1],
+        )
+
     try:
         import win32print
         import win32ui
@@ -349,11 +370,57 @@ def spool_to_printer(file_path: str, printer_name: str) -> None:
     try:
         hprinter = win32print.OpenPrinter(printer_name)
         try:
+            # ----------------------------------------------------------
+            # Configure DEVMODE to match the requested paper size
+            # ----------------------------------------------------------
+            devmode = None
+            if media_size_mm:
+                try:
+                    # Get the printer's current DEVMODE as a starting point
+                    props = win32print.GetPrinter(hprinter, 2)
+                    devmode = props["pDevMode"]
+
+                    # Set custom paper size in tenths-of-mm (DEVMODE units)
+                    width_mm, height_mm = media_size_mm
+                    devmode.PaperSize = 256  # DMPAPER_USER (custom)
+                    devmode.PaperWidth = int(round(width_mm * 10))   # tenths of mm
+                    devmode.PaperLength = int(round(height_mm * 10))  # tenths of mm
+
+                    # Tell DEVMODE which fields we're overriding
+                    devmode.Fields |= (
+                        0x00000002  # DM_PAPERSIZE
+                        | 0x00000008  # DM_PAPERLENGTH
+                        | 0x00000004  # DM_PAPERWIDTH
+                    )
+
+                    logger.info(
+                        "DEVMODE configured: PaperWidth=%d PaperLength=%d (tenths-mm)",
+                        devmode.PaperWidth, devmode.PaperLength,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to configure DEVMODE for media size — "
+                        "falling back to driver defaults"
+                    )
+                    devmode = None
+
+            # ----------------------------------------------------------
+            # Create the printer DC (with or without custom DEVMODE)
+            # ----------------------------------------------------------
             hdc = win32ui.CreateDC()
-            hdc.CreatePrinterDC(printer_name)
+            if devmode is not None:
+                hdc.CreatePrinterDC(printer_name)
+                # Apply the custom DEVMODE via ResetDC
+                hdc.ResetDC(devmode)
+                logger.info("Printer DC reset with custom DEVMODE")
+            else:
+                hdc.CreatePrinterDC(printer_name)
 
             printer_dpi_x = hdc.GetDeviceCaps(win32con.LOGPIXELSX)
             printer_dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
+            logger.info(
+                "Printer DPI: %d × %d", printer_dpi_x, printer_dpi_y,
+            )
 
             hdc.StartDoc(file_path)
 
@@ -361,38 +428,71 @@ def spool_to_printer(file_path: str, printer_name: str) -> None:
             for page_num in range(len(pdf_doc)):
                 logger.info("Rendering page %d/%d...", page_num + 1, len(pdf_doc))
                 hdc.StartPage()
-                
+
                 page = pdf_doc.load_page(page_num)
-                
+
+                # The DC's imageable area — after DEVMODE is applied this
+                # correctly reflects the requested paper size.
                 printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
                 printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
-                
-                # Scale the PDF page to fit perfectly inside the printable area
-                scale_x = printable_width / page.rect.width
-                scale_y = printable_height / page.rect.height
-                scale = min(scale_x, scale_y)
-                
-                matrix = fitz.Matrix(scale, scale)
-                
+                logger.info(
+                    "DC imageable area: %d × %d px  (page PDF rect: %.1f × %.1f pts)",
+                    printable_width, printable_height,
+                    page.rect.width, page.rect.height,
+                )
+
+                # --------------------------------------------------
+                # DPI-based scaling: render the PDF at the printer's
+                # native resolution so 1 PDF point → DPI/72 pixels.
+                # Then fit-to-page only if the result exceeds the
+                # imageable area (safety clamp).
+                # --------------------------------------------------
+                dpi_scale_x = printer_dpi_x / 72.0
+                dpi_scale_y = printer_dpi_y / 72.0
+
+                # Rendered size in device pixels at native DPI
+                rendered_w = page.rect.width * dpi_scale_x
+                rendered_h = page.rect.height * dpi_scale_y
+
+                # If the rendered page is larger than the printable area,
+                # shrink to fit (preserving aspect ratio).  Otherwise
+                # print at 1:1 physical size.
+                if rendered_w > printable_width or rendered_h > printable_height:
+                    fit_scale = min(
+                        printable_width / rendered_w,
+                        printable_height / rendered_h,
+                    )
+                    logger.info(
+                        "Page exceeds printable area — shrink-to-fit scale=%.4f",
+                        fit_scale,
+                    )
+                else:
+                    fit_scale = 1.0
+
+                final_scale_x = dpi_scale_x * fit_scale
+                final_scale_y = dpi_scale_y * fit_scale
+
+                matrix = fitz.Matrix(final_scale_x, final_scale_y)
+
                 # Render to pixmap
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
-                
+
                 # Convert to PIL Image
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                
+
                 # Center the image on the physical page
                 x_offset = (printable_width - pix.width) // 2
                 y_offset = (printable_height - pix.height) // 2
-                
+
                 # Draw to DC
                 dib = ImageWin.Dib(img)
                 dib.draw(
-                    hdc.GetHandleOutput(), 
+                    hdc.GetHandleOutput(),
                     (x_offset, y_offset, x_offset + pix.width, y_offset + pix.height)
                 )
-                
+
                 hdc.EndPage()
-                
+
             pdf_doc.close()
             hdc.EndDoc()
             hdc.DeleteDC()
@@ -404,6 +504,7 @@ def spool_to_printer(file_path: str, printer_name: str) -> None:
         raise
     finally:
         pythoncom.CoUninitialize()
+
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +685,100 @@ def extract_document_data(raw: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# IPP media-size keyword → physical dimensions (width_mm, height_mm)
+# ---------------------------------------------------------------------------
+# Keys are the standard IPP "media" keyword values defined in PWG 5101.1.
+# Values are (width_mm, height_mm).
+IPP_MEDIA_SIZES: dict[str, Tuple[float, float]] = {
+    # ISO A-series
+    "iso_a3_297x420mm":    (297.0, 420.0),
+    "iso_a4_210x297mm":    (210.0, 297.0),
+    "iso_a5_148x210mm":    (148.0, 210.0),
+    "iso_a6_105x148mm":    (105.0, 148.0),
+    "iso_a7_74x105mm":     (74.0,  105.0),
+    "iso_a8_52x74mm":      (52.0,  74.0),
+    # ISO B-series
+    "iso_b5_176x250mm":    (176.0, 250.0),
+    "iso_b6_125x176mm":    (125.0, 176.0),
+    # ISO C-series (envelopes)
+    "iso_c5_162x229mm":    (162.0, 229.0),
+    "iso_c6_114x162mm":    (114.0, 162.0),
+    # ISO DL envelope
+    "iso_dl_110x220mm":    (110.0, 220.0),
+    # North American sizes
+    "na_letter_8.5x11in":  (215.9, 279.4),
+    "na_legal_8.5x14in":   (215.9, 355.6),
+    "na_executive_7.25x10.5in": (184.15, 266.7),
+    "na_invoice_5.5x8.5in":    (139.7, 215.9),
+    # Common label / receipt sizes
+    "na_index-4x6_4x6in": (101.6, 152.4),
+    "om_small-photo_100x150mm": (100.0, 150.0),
+    "om_100x150mm_100x150mm":   (100.0, 150.0),
+    "custom_4x6in_4x6in":      (101.6, 152.4),
+}
+
+
+def extract_ipp_job_attributes(raw: bytes) -> dict[str, str]:
+    """
+    Walk the IPP attribute groups in *raw* and return a dict of
+    interesting job-template attributes (string-valued).
+
+    Currently extracts: ``media``, ``media-type``, ``copies``.
+    Unknown or non-string attributes are silently skipped.
+    """
+    attrs: dict[str, str] = {}
+    idx = 8  # skip the 8-byte IPP header
+
+    # Value-tag ranges that encode text / keyword / name / uri etc.
+    _TEXT_TAGS = {
+        IPP_TAG_TEXT, IPP_TAG_NAME, IPP_TAG_KEYWORD,
+        IPP_TAG_URI, IPP_TAG_URISCHEME, IPP_TAG_CHARSET,
+        IPP_TAG_LANGUAGE, IPP_TAG_MIMETYPE,
+    }
+
+    while idx < len(raw):
+        tag = raw[idx]
+        idx += 1
+
+        # Delimiter tags (0x00-0x05)
+        if tag <= 0x05:
+            if tag == IPP_TAG_END:
+                break
+            continue
+
+        # Value tag — parse name + value
+        if idx + 2 > len(raw):
+            break
+        name_len = struct.unpack("!H", raw[idx:idx + 2])[0]
+        idx += 2
+        if idx + name_len > len(raw):
+            break
+        attr_name = raw[idx:idx + name_len].decode("ascii", errors="replace") if name_len else ""
+        idx += name_len
+
+        if idx + 2 > len(raw):
+            break
+        value_len = struct.unpack("!H", raw[idx:idx + 2])[0]
+        idx += 2
+        if idx + value_len > len(raw):
+            break
+        attr_value_raw = raw[idx:idx + value_len]
+        idx += value_len
+
+        # Only capture named (non-additional-value) text-like attributes
+        if attr_name and tag in _TEXT_TAGS:
+            attr_value = attr_value_raw.decode("utf-8", errors="replace")
+            attrs[attr_name] = attr_value
+
+        # Capture integer attributes (e.g. copies)
+        if attr_name and tag == IPP_TAG_INTEGER and value_len == 4:
+            attrs[attr_name] = str(struct.unpack("!i", attr_value_raw)[0])
+
+    logger.info("Parsed IPP job attributes: %s", attrs)
+    return attrs
+
+
+# ---------------------------------------------------------------------------
 # Build rich Get-Printer-Attributes response
 # ---------------------------------------------------------------------------
 
@@ -650,14 +845,26 @@ def _build_printer_attributes(
     # Pages-per-minute (informational)
     attrs += _encode_integer_attribute("pages-per-minute", 10)
 
-    # Media & page size — 'iso_a4_210x297mm' + 'na_letter_8.5x11in'
+    # Media & page size — advertise all sizes from our lookup table so that
+    # iOS / Android can pick any of them in the paper-size dialog.
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-default", "iso_a4_210x297mm")
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-supported", "iso_a4_210x297mm")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"na_letter_8.5x11in")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"iso_a5_148x210mm")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"iso_a6_105x148mm")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"iso_a7_74x105mm")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"iso_a8_52x74mm")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"na_legal_8.5x14in")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"na_index-4x6_4x6in")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"om_small-photo_100x150mm")
 
     # media-ready — iOS 16+ requires this to show the printer.
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-ready", "iso_a4_210x297mm")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"na_letter_8.5x11in")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"iso_a5_148x210mm")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"iso_a6_105x148mm")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"na_index-4x6_4x6in")
+
 
     # media-col-supported — iOS 16+ checks for this collection attribute.
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-col-supported", "media-size")
@@ -850,6 +1057,24 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         self, raw: bytes, req_id: int, ver_maj: int, ver_min: int,
     ) -> None:
         """Extract the document payload and spool it."""
+        # ---- Parse IPP job attributes (media, copies, etc.) ----
+        job_attrs_parsed = extract_ipp_job_attributes(raw)
+        media_keyword = job_attrs_parsed.get("media", "")
+        media_size_mm: Optional[Tuple[float, float]] = None
+        if media_keyword:
+            media_size_mm = IPP_MEDIA_SIZES.get(media_keyword)
+            if media_size_mm:
+                logger.info(
+                    "IPP media='%s' → %.1f × %.1f mm",
+                    media_keyword, media_size_mm[0], media_size_mm[1],
+                )
+            else:
+                logger.warning(
+                    "IPP media='%s' not found in lookup table — "
+                    "will use printer driver defaults",
+                    media_keyword,
+                )
+
         doc_data = extract_document_data(raw)
         if not doc_data:
             logger.error("No document data found in Print-Job payload")
@@ -882,8 +1107,9 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                 spool_path = convert_urf_to_pdf(tmp_path)
                 logger.info("Spool path after conversion: %s", spool_path)
 
-            # Spool
-            spool_to_printer(spool_path, self.printer_name)
+            # Spool — pass the media size so the printer DC gets the right DEVMODE
+            spool_to_printer(spool_path, self.printer_name, media_size_mm=media_size_mm)
+
 
         except OSError:
             logger.exception("Failed to write temp file")

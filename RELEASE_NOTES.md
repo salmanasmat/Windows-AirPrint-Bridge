@@ -1,3 +1,19 @@
+## v1.3.0 - 2026-09-11
+
+### 🎯 Dynamic Media Size Handling & Label Printer Scaling Fix
+- **IPP Media Attribute Parsing:** Implemented structured binary IPP job attribute extraction (`extract_ipp_job_attributes`) to parse client-selected paper sizes such as `media` keywords (e.g., `iso_a6_105x148mm`, `na_index-4x6_4x6in`).
+- **Physical Media Dimensions Mapping:** Added `IPP_MEDIA_SIZES` lookup mapping standard PWG media keywords across ISO A/B/C series, North American formats, and label/receipt sizes directly to millimeter dimensions.
+- **Windows DC DEVMODE Configuration:** Dynamically adjusts the printer Device Context `DEVMODE` (`DMPAPER_USER` with `PaperWidth` and `PaperLength` in tenths of mm) via `ResetDC()`, ensuring Windows spooler respects the requested paper format.
+- **True DPI-Aware 1:1 Scaling:** Replaced canvas-dependent stretch scaling with native DPI rendering (`printer_dpi / 72.0`), fixing the issue where A6 and thermal labels printed significantly smaller on label printers (such as Zebra ZD220D). Includes automatic shrink-to-fit safety clamping.
+- **Expanded Media Advertisements:** Advertised A5, A6, A7, A8, US Legal, 4×6", and 100×150mm formats in `media-supported` and `media-ready` attributes so iOS and Android dialogs present label sizes natively.
+
+## v1.2.0 - 2026-08-20
+
+### 🤖 Native Android & IPP Everywhere Compatibility
+- **Android BIPS Discovery:** Synchronized mDNS TXT UUIDs and IPP `printer-uuid` attributes to ensure seamless discovery by the Android Default Print Service and Mopria.
+- **PWG-Raster & Format Support:** Added `image/pwg-raster` to supported MIME types for standard IPP Everywhere clients.
+- **Protocol Parity:** Enforced RFC 8011 IPP version matching between requests and responses.
+
 ## v1.1.1 - 2026-08-12
 
 ### 🌐 Multi-PC Network & Display Enhancements

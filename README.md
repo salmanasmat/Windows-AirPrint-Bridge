@@ -14,7 +14,7 @@ A production-ready, standalone Python script that acts as an AirPrint and IPP (I
 - **Strict iOS 18 Compatibility:** Implements Apple's required TXT record properties (like deterministic `UUID` matching and URF capability strings) to pass the strict iOS 18 discovery validation checks.
 - **HTTP/1.1 & Chunked Transfer Encoding:** A custom HTTP server that natively handles the `Expect: 100-continue` and chunked HTTP payloads sent by iOS for large print jobs.
 - **Robust Headless PDF Rendering:** Avoids unreliable Windows shell commands (like `ShellExecute printto`) which break when Microsoft Edge is the default PDF viewer. Instead, it uses `PyMuPDF` to render documents natively.
-- **Scale-to-Fit:** Automatically detects your printer's exact printable area (DPI and physical dimensions) and mathematically scales the document to fit perfectly and center on the page, preventing clipping or distortion.
+- **Scale-to-Fit & DPI-Aware 1:1 Rendering:** Dynamically parses IPP `media` paper size attributes (A4, A5, A6, 4×6" labels, etc.) and configures Windows printer `DEVMODE` settings per print job. Renders at true physical 1:1 scale using the printer's native DPI with automatic safety clamping, fixing shrunken prints on thermal label printers (like Zebra ZD220D).
 
 ## Supported Devices
 
@@ -25,7 +25,7 @@ By strictly adhering to Apple AirPrint and standard IPP Everywhere requirements,
 - **Android:** Natively supported via the Android Default Print Service and Mopria (IPP Everywhere).
 
 > [!TIP]
-> **v1.2.0 Release Highlights:** v1.2.0 introduces full native Android discovery compatibility (synchronizing mDNS/IPP UUIDs, enforcing RFC 8011 attribute compliance, and adding PWG-Raster format support) alongside existing iOS AirPrint support.
+> **v1.3.0 Release Highlights:** v1.3.0 introduces dynamic IPP media paper size decoding (supporting A6, 4×6", and custom label forms), per-job `DEVMODE` configuration on the Windows printer DC, and true DPI-aware 1:1 document scaling to fix shrunken prints on thermal label printers like the Zebra ZD220D.
 
 ## Android Configuration (Important)
 
@@ -46,7 +46,7 @@ To make your Windows printer discoverable on Android:
 
 The easiest way to install and run AirPrint Bridge on Windows is using the pre-compiled installer. **No Python installation or dependencies are required.** Everything is bundled into a self-contained background Windows Service that automatically starts when your PC boots.
 
-1. Download the latest `AirPrintBridge_Setup_v1.2.0.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
+1. Download the latest `AirPrintBridge_Setup_v1.3.0.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
 2. Run the installer as Administrator and follow the setup wizard.
 3. The AirPrint Bridge service will automatically start in the background.
 4. On your iOS or Android device (connected to the same Wi-Fi network), open a document or photo, tap **Print**, and select your Windows printer.
