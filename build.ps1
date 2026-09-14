@@ -12,6 +12,7 @@ if (-not (Get-Command "pyinstaller" -ErrorAction SilentlyContinue)) {
 python -m PyInstaller --onefile `
     --console `
     --hidden-import win32timezone `
+    --hidden-import win32gui `
     --hidden-import win32ui `
     --hidden-import win32con `
     --hidden-import pythoncom `

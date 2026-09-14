@@ -1,3 +1,13 @@
+## v1.3.1 - 2026-09-14
+
+### 🏷️ Complete Label Printer & PDF Scaling Resolution (Issue #3)
+- **IPP Collection Attributes (`media-col`):** Enhanced the IPP binary attribute parser to properly decode collection member attributes (`0x4A`), extracting `media-size-name`, `media`, and dimensional `x-dimension` / `y-dimension` values sent by iOS PrintKit.
+- **Pre-Document Byte Scanning Fallback:** Added a binary keyword scanner across the pre-document IPP header as an additional layer of protection to catch requested paper sizes.
+- **Automatic PDF Page Dimension Fallback:** When printing directly from Safari, Files, or Photos where iOS omits the IPP `media` attribute, the bridge now inspects page 0 of the PDF to auto-detect its true physical dimensions (e.g., 105 × 148.5 mm for A6).
+- **Robust Win32 GDI DEVMODE & DC Architecture:** Replaced the unsupported `PyCDC.ResetDC()` call with printer form matching via `win32print.DeviceCapabilities` (`DC_PAPERS`, `DC_PAPERSIZE`, `DC_PAPERNAMES`), standard form fallbacks (`DMPAPER_A6 = 70`), driver validation via `win32print.DocumentProperties()`, and direct DC instantiation via `win32gui.CreateDC('WINSPOOL', printer_name, devmode)` + `win32ui.CreateDCFromHandle()`.
+- **Thermal Label Aspect Ratio Guard:** Added a safety guard preventing aggressive vertical shrinking on thermal label printers when the document width matches the physical printhead but the driver's default form height is smaller.
+- **Dynamic `media-default` Discovery:** Automatically inspects the printer's active Windows DEVMODE so AirPrint discovery advertises the printer's actual form (e.g. A6 for label printers) as `media-default`.
+
 ## v1.3.0 - 2026-09-11
 
 ### 🎯 Dynamic Media Size Handling & Label Printer Scaling Fix

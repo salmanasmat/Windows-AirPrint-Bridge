@@ -25,7 +25,7 @@ By strictly adhering to Apple AirPrint and standard IPP Everywhere requirements,
 - **Android:** Natively supported via the Android Default Print Service and Mopria (IPP Everywhere).
 
 > [!TIP]
-> **v1.3.0 Release Highlights:** v1.3.0 introduces dynamic IPP media paper size decoding (supporting A6, 4×6", and custom label forms), per-job `DEVMODE` configuration on the Windows printer DC, and true DPI-aware 1:1 document scaling to fix shrunken prints on thermal label printers like the Zebra ZD220D.
+> **v1.3.1 Release Highlights:** v1.3.1 introduces a comprehensive fix for thermal label printers (like the Zebra ZD220D) and custom paper formats: full IPP `media-col` collection parsing, automatic PDF page dimension auto-detection, robust Win32 GDI printer form matching and DEVMODE configuration via `win32gui.CreateDC`, and thermal label aspect ratio preservation to guarantee 1:1 scale prints without shrinking.
 
 ## Android Configuration (Important)
 
@@ -46,7 +46,7 @@ To make your Windows printer discoverable on Android:
 
 The easiest way to install and run AirPrint Bridge on Windows is using the pre-compiled installer. **No Python installation or dependencies are required.** Everything is bundled into a self-contained background Windows Service that automatically starts when your PC boots.
 
-1. Download the latest `AirPrintBridge_Setup_v1.3.0.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
+1. Download the latest `AirPrintBridge_Setup_v1.3.1.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
 2. Run the installer as Administrator and follow the setup wizard.
 3. The AirPrint Bridge service will automatically start in the background.
 4. On your iOS or Android device (connected to the same Wi-Fi network), open a document or photo, tap **Print**, and select your Windows printer.
