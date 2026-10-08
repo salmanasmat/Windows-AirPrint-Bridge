@@ -1,5 +1,5 @@
 #define MyAppName "AirPrint Bridge"
-#define MyAppVersion "1.3.1"
+#define MyAppVersion "1.4.0"
 #define MyAppPublisher "Salman Asmat"
 #define MyAppExeName "AirPrintBridge.exe"
 #define MyAppDir "C:\Program Files\AirPrintBridge"
@@ -32,6 +32,7 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "remove"; Flags: runhidden waitun
 
 [UninstallDelete]
 Type: files; Name: "{app}\airprint_bridge.log"
+Type: files; Name: "{app}\config.json"
 
 [Code]
 procedure StopAndRemoveExistingService();

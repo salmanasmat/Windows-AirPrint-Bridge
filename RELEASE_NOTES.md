@@ -1,3 +1,12 @@
+## v1.4.0 - 2026-10-08
+
+### 📄 Multi-Copy Printing & GitHub Feature Requests (#4 & #5)
+- **Multi-Copy Spooling Fix:** Fixed an issue where incrementing the "number of copies" on iOS/Android devices only spooled a single copy. The bridge now extracts the IPP `copies` attribute (clamped 1..99), spools collated copies in software, and explicitly enforces `devmode.Copies = 1` in Windows GDI to prevent driver double-multiplication.
+- **Reverse Page Order / Print Last Page First (Issue #4):** Added support for printing multi-page documents in reverse order (`N → 1`). When enabled, pages land face-up in the output tray forming a properly collated stack (especially useful for vintage and mobile printers such as Canon BJC-85).
+- **Auto-Rotate Landscape Pages (Issue #5):** Added automatic per-page orientation detection and rotation. Rotates landscape pages 90° clockwise to fit portrait paper (and vice-versa) losslessly via PyMuPDF before rasterization, resolving formatting issues on iOS which lacks an orientation dialog.
+- **Configuration File Support (`config.json`):** Introduced a lightweight JSON configuration file automatically generated next to the executable on first run, providing user toggles for `reverse_page_order` and `auto_rotate_to_fit`.
+- **Hardware Testing Disclaimer:** Reverse page order (Issue #4) and auto-rotate (Issue #5) are community-driven additions provided as experimental features, as the maintainer does not possess every specific printer hardware setup (e.g. vintage face-up printers like the Canon BJC-85). User testing feedback is encouraged and appreciated!
+
 ## v1.3.1 - 2026-09-14
 
 ### 🏷️ Complete Label Printer & PDF Scaling Resolution (Issue #3)

@@ -24,6 +24,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import html
+import json
 import logging
 import os
 import signal
@@ -66,7 +67,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION: str = "1.3.1"
+VERSION: str = "1.4.0"
 IPP_PORT: int = 631
 IPP_SERVICE_TYPE: str = "_ipp._tcp.local."
 
@@ -146,6 +147,37 @@ logger.addHandler(_file_handler)
 
 # Prevent any output to stdout/stderr (headless-safe for pythonw.exe)
 logging.getLogger().handlers = []
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONFIG_FILE: Path = _app_dir / "config.json"
+
+_CONFIG_DEFAULTS: dict[str, bool] = {
+    "reverse_page_order": False,
+    "auto_rotate_to_fit": False,
+}
+
+
+def load_config() -> dict[str, bool]:
+    """Load config.json, creating it with defaults if it doesn't exist."""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                user_config = json.load(f)
+            merged = {**_CONFIG_DEFAULTS, **user_config}
+            logger.debug("Loaded configuration from %s: %s", CONFIG_FILE, merged)
+            return merged
+        except Exception:
+            logger.exception("Failed to load config.json, using defaults")
+    else:
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(_CONFIG_DEFAULTS, f, indent=4)
+            logger.info("Created default config.json at %s", CONFIG_FILE)
+        except Exception:
+            logger.debug("Could not create default config.json: %s", CONFIG_FILE)
+    return dict(_CONFIG_DEFAULTS)
 
 
 # ---------------------------------------------------------------------------
@@ -332,15 +364,20 @@ def spool_to_printer(
     file_path: str,
     printer_name: str,
     media_size_mm: Optional[Tuple[float, float]] = None,
+    copies: int = 1,
 ) -> None:
     """
     Send *file_path* to the Windows print queue of *printer_name*.
 
     Uses PyMuPDF to rasterize the PDF and win32ui / win32gui to send it
     directly to the printer's Device Context (DC) configured for the
-    correct physical paper size.
+    correct physical paper size and requested copies.
     """
-    logger.info("Spooling '%s' to printer '%s'", file_path, printer_name)
+    copies = max(1, min(99, int(copies)))
+    logger.info(
+        "Spooling '%s' to printer '%s' (copies=%d)",
+        file_path, printer_name, copies,
+    )
 
     try:
         import win32print
@@ -382,14 +419,23 @@ def spool_to_printer(
         hprinter = win32print.OpenPrinter(printer_name)
         try:
             # ----------------------------------------------------------
-            # Configure DEVMODE to match the target paper size
+            # Configure DEVMODE to match target paper size & single copy
             # ----------------------------------------------------------
             devmode = None
-            if media_size_mm:
+            try:
+                props = win32print.GetPrinter(hprinter, 2)
+                devmode = props.get("pDevMode")
+                if devmode is not None:
+                    # Enforce single copy in hardware DEVMODE so driver doesn't
+                    # multiply our software collated copy loop.
+                    devmode.Copies = 1
+                    devmode.Fields |= win32con.DM_COPIES
+            except Exception:
+                logger.debug("Could not retrieve base DEVMODE")
+
+            if media_size_mm and devmode is not None:
                 try:
                     width_mm, height_mm = media_size_mm
-                    props = win32print.GetPrinter(hprinter, 2)
-                    devmode = props["pDevMode"]
 
                     # Set orientation: Landscape if wider than tall, else Portrait
                     if width_mm > height_mm:
@@ -494,70 +540,119 @@ def spool_to_printer(
             printer_dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
             logger.info("Printer DPI: %d × %d", printer_dpi_x, printer_dpi_y)
 
-            hdc.StartDoc(file_path)
+            config = load_config()
+            reverse_page_order = bool(config.get("reverse_page_order", False))
+            auto_rotate_to_fit = bool(config.get("auto_rotate_to_fit", False))
 
             pdf_doc = fitz.open(file_path)
-            for page_num in range(len(pdf_doc)):
-                logger.info("Rendering page %d/%d...", page_num + 1, len(pdf_doc))
-                hdc.StartPage()
+            page_count = len(pdf_doc)
 
-                page = pdf_doc.load_page(page_num)
-
-                printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
-                printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
-                logger.info(
-                    "DC imageable area: %d × %d px  (page PDF rect: %.1f × %.1f pts)",
-                    printable_width, printable_height,
-                    page.rect.width, page.rect.height,
-                )
-
-                # --------------------------------------------------
-                # DPI-based scaling: render at native printer DPI
-                # (1 PDF pt = DPI/72 pixels).
-                # --------------------------------------------------
-                dpi_scale_x = printer_dpi_x / 72.0
-                dpi_scale_y = printer_dpi_y / 72.0
-
-                rendered_w = page.rect.width * dpi_scale_x
-                rendered_h = page.rect.height * dpi_scale_y
-
-                scale_w = printable_width / rendered_w if rendered_w > 0 else 1.0
-                scale_h = printable_height / rendered_h if rendered_h > 0 else 1.0
-
-                # If width matches printable area (within 5%) but height is much smaller
-                # (typical for thermal label printers where the driver form height is smaller
-                # than the actual label stock), DO NOT shrink width to fit height!
-                if scale_w >= 0.95 and scale_h < 0.7:
-                    logger.warning(
-                        "Printer DC height (%d px) is significantly smaller than document height (%d px), "
-                        "but width matches (%.1f%%). Preserving 1:1 scale to avoid shrunken label.",
-                        printable_height, int(rendered_h), scale_w * 100.0,
-                    )
-                    fit_scale = min(1.0, scale_w)
-                elif rendered_w > printable_width or rendered_h > printable_height:
-                    fit_scale = min(scale_w, scale_h)
-                    logger.info("Page exceeds printable area — shrink-to-fit scale=%.4f", fit_scale)
+            # Pre-pass: auto-rotate landscape/portrait pages to match paper if enabled (Issue #5)
+            if auto_rotate_to_fit and page_count > 0:
+                paper_is_portrait = True
+                if devmode is not None and getattr(devmode, "Orientation", None):
+                    paper_is_portrait = (devmode.Orientation == win32con.DMORIENT_PORTRAIT)
                 else:
-                    fit_scale = 1.0
+                    dc_w = hdc.GetDeviceCaps(win32con.HORZRES)
+                    dc_h = hdc.GetDeviceCaps(win32con.VERTRES)
+                    paper_is_portrait = (dc_h >= dc_w)
 
-                final_scale_x = dpi_scale_x * fit_scale
-                final_scale_y = dpi_scale_y * fit_scale
+                for pno in range(page_count):
+                    p = pdf_doc.load_page(pno)
+                    is_page_landscape = p.rect.width > p.rect.height
+                    if is_page_landscape and paper_is_portrait:
+                        p.set_rotation((p.rotation + 90) % 360)
+                        logger.info(
+                            "Auto-rotated page %d (landscape -> 90° CW to fit portrait paper)",
+                            pno + 1,
+                        )
+                    elif not is_page_landscape and not paper_is_portrait:
+                        p.set_rotation((p.rotation + 90) % 360)
+                        logger.info(
+                            "Auto-rotated page %d (portrait -> 90° CW to fit landscape paper)",
+                            pno + 1,
+                        )
 
-                matrix = fitz.Matrix(final_scale_x, final_scale_y)
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-                x_offset = max(0, (printable_width - pix.width) // 2)
-                y_offset = max(0, (printable_height - pix.height) // 2)
-
-                dib = ImageWin.Dib(img)
-                dib.draw(
-                    hdc.GetHandleOutput(),
-                    (x_offset, y_offset, x_offset + pix.width, y_offset + pix.height)
+            # Determine page sequence (Issue #4)
+            if reverse_page_order:
+                page_indices = list(range(page_count - 1, -1, -1))
+                logger.info(
+                    "Reverse page order enabled — printing %d pages in reverse order: %s",
+                    page_count, [idx + 1 for idx in page_indices],
                 )
+            else:
+                page_indices = list(range(page_count))
 
-                hdc.EndPage()
+            hdc.StartDoc(file_path)
+
+            for copy_idx in range(copies):
+                if copies > 1:
+                    logger.info("Spooling copy %d/%d (%d pages)...", copy_idx + 1, copies, page_count)
+
+                for page_num in page_indices:
+                    logger.info(
+                        "Rendering page %d/%d (copy %d/%d)...",
+                        page_num + 1, page_count, copy_idx + 1, copies,
+                    )
+                    hdc.StartPage()
+
+                    page = pdf_doc.load_page(page_num)
+
+                    printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
+                    printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
+                    logger.info(
+                        "DC imageable area: %d × %d px  (page PDF rect: %.1f × %.1f pts)",
+                        printable_width, printable_height,
+                        page.rect.width, page.rect.height,
+                    )
+
+                    # --------------------------------------------------
+                    # DPI-based scaling: render at native printer DPI
+                    # (1 PDF pt = DPI/72 pixels).
+                    # --------------------------------------------------
+                    dpi_scale_x = printer_dpi_x / 72.0
+                    dpi_scale_y = printer_dpi_y / 72.0
+
+                    rendered_w = page.rect.width * dpi_scale_x
+                    rendered_h = page.rect.height * dpi_scale_y
+
+                    scale_w = printable_width / rendered_w if rendered_w > 0 else 1.0
+                    scale_h = printable_height / rendered_h if rendered_h > 0 else 1.0
+
+                    # If width matches printable area (within 5%) but height is much smaller
+                    # (typical for thermal label printers where the driver form height is smaller
+                    # than the actual label stock), DO NOT shrink width to fit height!
+                    if scale_w >= 0.95 and scale_h < 0.7:
+                        logger.warning(
+                            "Printer DC height (%d px) is significantly smaller than document height (%d px), "
+                            "but width matches (%.1f%%). Preserving 1:1 scale to avoid shrunken label.",
+                            printable_height, int(rendered_h), scale_w * 100.0,
+                        )
+                        fit_scale = min(1.0, scale_w)
+                    elif rendered_w > printable_width or rendered_h > printable_height:
+                        fit_scale = min(scale_w, scale_h)
+                        logger.info("Page exceeds printable area — shrink-to-fit scale=%.4f", fit_scale)
+                    else:
+                        fit_scale = 1.0
+
+                    final_scale_x = dpi_scale_x * fit_scale
+                    final_scale_y = dpi_scale_y * fit_scale
+
+                    matrix = fitz.Matrix(final_scale_x, final_scale_y)
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+                    x_offset = max(0, (printable_width - pix.width) // 2)
+                    y_offset = max(0, (printable_height - pix.height) // 2)
+
+                    dib = ImageWin.Dib(img)
+                    dib.draw(
+                        hdc.GetHandleOutput(),
+                        (x_offset, y_offset, x_offset + pix.width, y_offset + pix.height)
+                    )
+
+                    hdc.EndPage()
 
             pdf_doc.close()
             hdc.EndDoc()
@@ -1217,6 +1312,19 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 pass
 
+        # Extract requested number of copies (default 1, clamped 1..99)
+        copies = 1
+        if "copies" in job_attrs_parsed:
+            try:
+                copies = max(1, min(99, int(job_attrs_parsed["copies"])))
+                logger.info("IPP requested copies: %d", copies)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Invalid copies attribute '%s', defaulting to 1",
+                    job_attrs_parsed["copies"],
+                )
+                copies = 1
+
         doc_data = extract_document_data(raw)
         if not doc_data:
             logger.error("No document data found in Print-Job payload")
@@ -1249,8 +1357,13 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                 spool_path = convert_urf_to_pdf(tmp_path)
                 logger.info("Spool path after conversion: %s", spool_path)
 
-            # Spool — pass the media size so the printer DC gets the right DEVMODE
-            spool_to_printer(spool_path, self.printer_name, media_size_mm=media_size_mm)
+            # Spool — pass media size and copies
+            spool_to_printer(
+                spool_path,
+                self.printer_name,
+                media_size_mm=media_size_mm,
+                copies=copies,
+            )
 
 
         except OSError:

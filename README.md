@@ -25,7 +25,29 @@ By strictly adhering to Apple AirPrint and standard IPP Everywhere requirements,
 - **Android:** Natively supported via the Android Default Print Service and Mopria (IPP Everywhere).
 
 > [!TIP]
-> **v1.3.1 Release Highlights:** v1.3.1 introduces a comprehensive fix for thermal label printers (like the Zebra ZD220D) and custom paper formats: full IPP `media-col` collection parsing, automatic PDF page dimension auto-detection, robust Win32 GDI printer form matching and DEVMODE configuration via `win32gui.CreateDC`, and thermal label aspect ratio preservation to guarantee 1:1 scale prints without shrinking.
+> **v1.4.0 Release Highlights:** v1.4.0 introduces multi-copy printing (honoring the "Number of Copies" counter from iOS/Android print sheets with proper collation), reverse page order printing (`N → 1` for face-up output tray printers such as Canon BJC-85), automatic rotation for landscape PDF pages to fit portrait paper (and vice-versa), and user configuration via `config.json`.
+
+## Configuration (Optional)
+
+AirPrint Bridge automatically detects your network interface, default printer, and paper dimensions with zero configuration required. For advanced features, a `config.json` file is automatically created in the application directory on first launch:
+
+```json
+{
+    "reverse_page_order": false,
+    "auto_rotate_to_fit": false
+}
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `reverse_page_order` | `false` | When `true`, prints multi-page documents in reverse order (`N → 1`). Ideal for printers that output pages face-up so the resulting stack is ordered 1..N. |
+| `auto_rotate_to_fit` | `false` | When `true`, automatically rotates landscape PDF pages 90° clockwise to fit portrait paper (and vice-versa). Eliminates manual rotation on iOS which lacks an orientation dialog. |
+
+> [!NOTE]
+> Changes to `config.json` take effect immediately on the next print job without requiring a service restart.
+
+> [!IMPORTANT]
+> **Hardware Testing Disclaimer:** The features for **Reverse Page Order** (Issue #4) and **Auto-Rotate Landscape Pages** (Issue #5) were implemented in response to community requests. Because the maintainer does not possess every specific printer hardware setup (e.g., vintage face-up printers such as the Canon BJC-85), these options are provided as experimental features based on protocol and raster specifications. Community testing reports and feedback across different printer models are welcome!
 
 ## Android Configuration (Important)
 
@@ -46,7 +68,7 @@ To make your Windows printer discoverable on Android:
 
 The easiest way to install and run AirPrint Bridge on Windows is using the pre-compiled installer. **No Python installation or dependencies are required.** Everything is bundled into a self-contained background Windows Service that automatically starts when your PC boots.
 
-1. Download the latest `AirPrintBridge_Setup_v1.3.1.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
+1. Download the latest `AirPrintBridge_Setup_v1.4.0.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
 2. Run the installer as Administrator and follow the setup wizard.
 3. The AirPrint Bridge service will automatically start in the background.
 4. On your iOS or Android device (connected to the same Wi-Fi network), open a document or photo, tap **Print**, and select your Windows printer.
