@@ -20,9 +20,9 @@ A production-ready, standalone Python script that acts as an AirPrint and IPP (I
 
 By strictly adhering to Apple AirPrint and standard IPP Everywhere requirements, this service achieves seamless driverless printing across platforms:
 
-- **iOS & iPadOS:** Fully tested and verified. Supports virtually all versions from **iOS 4.2 up through iOS 18+**. Passes strict zero-configuration checks introduced in iOS 16–18.
+- **iOS & iPadOS:** Fully tested and verified on iPhone (works fine). Supports virtually all versions from **iOS 4.2 up through iOS 18+**. Passes strict zero-configuration checks introduced in iOS 16–18.
 - **macOS:** Natively supported via Bonjour / AirPrint discovery.
-- **Android:** Natively supported via the Android Default Print Service and Mopria (IPP Everywhere).
+- **Android:** Implemented via standard IPP Everywhere / Mopria specifications *(untested by the author; see [Android Testing Disclaimer](#android-configuration-important))*.
 
 > [!TIP]
 > **v1.4.0 Release Highlights:** v1.4.0 introduces multi-copy printing (honoring the "Number of Copies" counter from iOS/Android print sheets with proper collation), reverse page order printing (`N → 1` for face-up output tray printers such as Canon BJC-85), automatic rotation for landscape PDF pages to fit portrait paper (and vice-versa), and user configuration via `config.json`.
@@ -50,6 +50,9 @@ AirPrint Bridge automatically detects your network interface, default printer, a
 > **Hardware Testing Disclaimer:** The features for **Reverse Page Order** (Issue #4) and **Auto-Rotate Landscape Pages** (Issue #5) were implemented in response to community requests. Because the maintainer does not possess every specific printer hardware setup (e.g., vintage face-up printers such as the Canon BJC-85), these options are provided as experimental features based on protocol and raster specifications. Community testing reports and feedback across different printer models are welcome!
 
 ## Android Configuration (Important)
+
+> [!IMPORTANT]
+> **Android Testing Disclaimer:** The author does not own an Android device, so Android printing has not been tested firsthand. This project has been tested only on iPhone, where it works fine. Android support is implemented in accordance with standard IPP Everywhere and Mopria specifications. Feedback and test results from Android users are warmly welcomed!
 
 Unlike iOS (where AirPrint is always enabled by default in the sharing sheet), **Android often has its built-in print service disabled by default** depending on the device manufacturer (e.g., Samsung, Xiaomi, OnePlus, Motorola).
 
