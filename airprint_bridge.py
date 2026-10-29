@@ -67,7 +67,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION: str = "1.4.0"
+VERSION: str = "1.4.1"
 IPP_PORT: int = 631
 IPP_SERVICE_TYPE: str = "_ipp._tcp.local."
 
@@ -360,23 +360,66 @@ def get_default_printer() -> str:
     return name
 
 
+def is_color_printer(printer_name: str) -> bool:
+    """Return True if the Windows printer supports color printing."""
+    try:
+        import win32con
+        dc_colordevice = getattr(win32con, "DC_COLORDEVICE", 32)
+        res = win32print.DeviceCapabilities(printer_name, "", dc_colordevice)
+        if res >= 0:
+            color_capable = bool(res)
+            logger.info(
+                "Printer '%s' DC_COLORDEVICE=%d (color=%s)",
+                printer_name, res, color_capable,
+            )
+            return color_capable
+    except Exception:
+        logger.debug("DeviceCapabilities(DC_COLORDEVICE) failed for '%s'", printer_name)
+
+    try:
+        import win32con
+        hprinter = win32print.OpenPrinter(printer_name)
+        try:
+            props = win32print.GetPrinter(hprinter, 2)
+            devmode = props.get("pDevMode")
+            if devmode is not None and (devmode.Fields & win32con.DM_COLOR):
+                return devmode.Color == win32con.DMCOLOR_COLOR
+        finally:
+            win32print.ClosePrinter(hprinter)
+    except Exception:
+        pass
+
+    return True
+
+
+_MONOCHROME_MODES = frozenset({
+    "monochrome",
+    "bi-level",
+    "process-monochrome",
+    "auto-monochrome",
+})
+
+
 def spool_to_printer(
     file_path: str,
     printer_name: str,
     media_size_mm: Optional[Tuple[float, float]] = None,
     copies: int = 1,
+    color_mode: Optional[str] = None,
 ) -> None:
     """
     Send *file_path* to the Windows print queue of *printer_name*.
 
     Uses PyMuPDF to rasterize the PDF and win32ui / win32gui to send it
     directly to the printer's Device Context (DC) configured for the
-    correct physical paper size and requested copies.
+    correct physical paper size, color mode, and requested copies.
     """
     copies = max(1, min(99, int(copies)))
+    normalized_color_mode = color_mode.strip().lower() if color_mode else None
+    is_monochrome = normalized_color_mode in _MONOCHROME_MODES
     logger.info(
-        "Spooling '%s' to printer '%s' (copies=%d)",
-        file_path, printer_name, copies,
+        "Spooling '%s' to printer '%s' (copies=%d, color_mode=%s)",
+        file_path, printer_name, copies, normalized_color_mode or "default",
     )
 
     try:
@@ -419,7 +462,7 @@ def spool_to_printer(
         hprinter = win32print.OpenPrinter(printer_name)
         try:
             # ----------------------------------------------------------
-            # Configure DEVMODE to match target paper size & single copy
+            # Configure DEVMODE to match target paper size, color & copy
             # ----------------------------------------------------------
             devmode = None
             try:
@@ -430,73 +473,86 @@ def spool_to_printer(
                     # multiply our software collated copy loop.
                     devmode.Copies = 1
                     devmode.Fields |= win32con.DM_COPIES
+
+                    # Configure color vs monochrome mode in DEVMODE (Issue #6)
+                    if is_monochrome:
+                        devmode.Color = win32con.DMCOLOR_MONOCHROME
+                        devmode.Fields |= win32con.DM_COLOR
+                        logger.info("DEVMODE Color set to DMCOLOR_MONOCHROME (1)")
+                    elif normalized_color_mode in ("color", "auto") or (
+                        normalized_color_mode is None and is_color_printer(printer_name)
+                    ):
+                        devmode.Color = win32con.DMCOLOR_COLOR
+                        devmode.Fields |= win32con.DM_COLOR
+                        logger.info("DEVMODE Color set to DMCOLOR_COLOR (2)")
             except Exception:
                 logger.debug("Could not retrieve base DEVMODE")
 
-            if media_size_mm and devmode is not None:
+            if devmode is not None:
                 try:
-                    width_mm, height_mm = media_size_mm
+                    if media_size_mm:
+                        width_mm, height_mm = media_size_mm
 
-                    # Set orientation: Landscape if wider than tall, else Portrait
-                    if width_mm > height_mm:
-                        devmode.Orientation = win32con.DMORIENT_LANDSCAPE
-                    else:
-                        devmode.Orientation = win32con.DMORIENT_PORTRAIT
-                    devmode.Fields |= win32con.DM_ORIENTATION
+                        # Set orientation: Landscape if wider than tall, else Portrait
+                        if width_mm > height_mm:
+                            devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+                        else:
+                            devmode.Orientation = win32con.DMORIENT_PORTRAIT
+                        devmode.Fields |= win32con.DM_ORIENTATION
 
-                    # Search printer's supported paper forms for a size match
-                    matched_id = None
-                    try:
-                        papers = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERS)
-                        sizes = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERSIZE)
-                        names = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERNAMES)
-                        for pid, s, name in zip(papers, sizes, names):
-                            pw = s["x"] / 10.0
-                            ph = s["y"] / 10.0
-                            if (abs(pw - width_mm) < 3.0 and abs(ph - height_mm) < 3.0) or \
-                               (abs(pw - height_mm) < 3.0 and abs(ph - width_mm) < 3.0):
-                                matched_id = pid
-                                logger.info(
-                                    "Matched printer form ID=%d (%s) for %.1f × %.1f mm",
-                                    pid, name.strip(), width_mm, height_mm,
-                                )
-                                break
-                    except Exception:
-                        logger.debug("DeviceCapabilities lookup failed, trying standard forms")
+                        # Search printer's supported paper forms for a size match
+                        matched_id = None
+                        try:
+                            papers = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERS)
+                            sizes = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERSIZE)
+                            names = win32print.DeviceCapabilities(printer_name, "", win32con.DC_PAPERNAMES)
+                            for pid, s, name in zip(papers, sizes, names):
+                                pw = s["x"] / 10.0
+                                ph = s["y"] / 10.0
+                                if (abs(pw - width_mm) < 3.0 and abs(ph - height_mm) < 3.0) or \
+                                   (abs(pw - height_mm) < 3.0 and abs(ph - width_mm) < 3.0):
+                                    matched_id = pid
+                                    logger.info(
+                                        "Matched printer form ID=%d (%s) for %.1f × %.1f mm",
+                                        pid, name.strip(), width_mm, height_mm,
+                                    )
+                                    break
+                        except Exception:
+                            logger.debug("DeviceCapabilities lookup failed, trying standard forms")
 
-                    # Fall back to standard Windows DMPAPER IDs
-                    if matched_id is None:
-                        standard_paper_map = {
-                            (210.0, 297.0): win32con.DMPAPER_A4,
-                            (148.0, 210.0): win32con.DMPAPER_A5,
-                            (105.0, 148.0): win32con.DMPAPER_A6,
-                            (105.0, 148.5): win32con.DMPAPER_A6,
-                            (297.0, 420.0): win32con.DMPAPER_A3,
-                            (215.9, 279.4): win32con.DMPAPER_LETTER,
-                            (215.9, 355.6): win32con.DMPAPER_LEGAL,
-                        }
-                        for (sw, sh), sid in standard_paper_map.items():
-                            if (abs(sw - width_mm) < 3.0 and abs(sh - height_mm) < 3.0) or \
-                               (abs(sw - height_mm) < 3.0 and abs(sh - width_mm) < 3.0):
-                                matched_id = sid
-                                logger.info(
-                                    "Matched standard Windows form ID=%d for %.1f × %.1f mm",
-                                    sid, width_mm, height_mm,
-                                )
-                                break
+                        # Fall back to standard Windows DMPAPER IDs
+                        if matched_id is None:
+                            standard_paper_map = {
+                                (210.0, 297.0): win32con.DMPAPER_A4,
+                                (148.0, 210.0): win32con.DMPAPER_A5,
+                                (105.0, 148.0): win32con.DMPAPER_A6,
+                                (105.0, 148.5): win32con.DMPAPER_A6,
+                                (297.0, 420.0): win32con.DMPAPER_A3,
+                                (215.9, 279.4): win32con.DMPAPER_LETTER,
+                                (215.9, 355.6): win32con.DMPAPER_LEGAL,
+                            }
+                            for (sw, sh), sid in standard_paper_map.items():
+                                if (abs(sw - width_mm) < 3.0 and abs(sh - height_mm) < 3.0) or \
+                                   (abs(sw - height_mm) < 3.0 and abs(sh - width_mm) < 3.0):
+                                    matched_id = sid
+                                    logger.info(
+                                        "Matched standard Windows form ID=%d for %.1f × %.1f mm",
+                                        sid, width_mm, height_mm,
+                                    )
+                                    break
 
-                    if matched_id is not None:
-                        devmode.PaperSize = matched_id
-                        devmode.Fields |= win32con.DM_PAPERSIZE
-                    else:
-                        devmode.PaperSize = 256  # DMPAPER_USER (custom)
-                        devmode.PaperWidth = int(round(width_mm * 10))
-                        devmode.PaperLength = int(round(height_mm * 10))
-                        devmode.Fields |= (
-                            win32con.DM_PAPERSIZE
-                            | win32con.DM_PAPERWIDTH
-                            | win32con.DM_PAPERLENGTH
-                        )
+                        if matched_id is not None:
+                            devmode.PaperSize = matched_id
+                            devmode.Fields |= win32con.DM_PAPERSIZE
+                        else:
+                            devmode.PaperSize = 256  # DMPAPER_USER (custom)
+                            devmode.PaperWidth = int(round(width_mm * 10))
+                            devmode.PaperLength = int(round(height_mm * 10))
+                            devmode.Fields |= (
+                                win32con.DM_PAPERSIZE
+                                | win32con.DM_PAPERWIDTH
+                                | win32con.DM_PAPERLENGTH
+                            )
 
                     # Validate and merge DEVMODE with printer driver
                     try:
@@ -508,12 +564,12 @@ def spool_to_printer(
                         logger.warning("DocumentProperties merge failed, using direct DEVMODE")
 
                     logger.info(
-                        "DEVMODE configured: PaperSize=%d, Orientation=%d",
-                        devmode.PaperSize, devmode.Orientation,
+                        "DEVMODE configured: PaperSize=%d, Orientation=%d, Color=%d",
+                        devmode.PaperSize, devmode.Orientation, getattr(devmode, "Color", 0),
                     )
                 except Exception:
                     logger.exception(
-                        "Failed to configure DEVMODE for media size — falling back to driver defaults"
+                        "Failed to configure DEVMODE — falling back to driver defaults"
                     )
                     devmode = None
 
@@ -642,6 +698,8 @@ def spool_to_printer(
                     pix = page.get_pixmap(matrix=matrix, alpha=False)
 
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    if is_monochrome:
+                        img = img.convert("L").convert("RGB")
 
                     x_offset = max(0, (printable_width - pix.width) // 2)
                     y_offset = max(0, (printable_height - pix.height) // 2)
@@ -1024,7 +1082,23 @@ def _build_printer_attributes(
     attrs += _encode_text_attribute(IPP_TAG_LANGUAGE, "generated-natural-language-supported", "en-us")
 
     # Color support — MUST be boolean per IPP spec; iOS rejects keyword encoding.
-    attrs += _encode_boolean_attribute("color-supported", False)
+    color_capable = is_color_printer(printer_name)
+    attrs += _encode_boolean_attribute("color-supported", color_capable)
+
+    # print-color-mode — required by macOS / IPP Everywhere so CUPS does not
+    # default to a grayscale-only queue (Issue #6).
+    if color_capable:
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-color-mode-supported", "monochrome")
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"color")
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-color-mode-default", "color")
+    else:
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-color-mode-supported", "monochrome")
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-color-mode-default", "monochrome")
+
+    # PWG Raster document types (sgray_8 + srgb_8 when color-capable)
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "pwg-raster-document-type-supported", "sgray_8")
+    if color_capable:
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"srgb_8")
 
     # Pages-per-minute (informational)
     attrs += _encode_integer_attribute("pages-per-minute", 10)
@@ -1155,7 +1229,8 @@ def _build_printer_attributes(
     attrs += _encode_text_attribute(
         IPP_TAG_KEYWORD, "urf-supported", "W8"
     )
-    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"SRGB24")
+    if color_capable:
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"SRGB24")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"V1.4")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"RS300-600")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"DM1")
@@ -1325,6 +1400,11 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                 )
                 copies = 1
 
+        # Extract requested print-color-mode (e.g. 'color', 'monochrome')
+        color_mode = job_attrs_parsed.get("print-color-mode")
+        if color_mode:
+            logger.info("IPP requested print-color-mode: %s", color_mode)
+
         doc_data = extract_document_data(raw)
         if not doc_data:
             logger.error("No document data found in Print-Job payload")
@@ -1357,12 +1437,13 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                 spool_path = convert_urf_to_pdf(tmp_path)
                 logger.info("Spool path after conversion: %s", spool_path)
 
-            # Spool — pass media size and copies
+            # Spool — pass media size, copies, and color mode
             spool_to_printer(
                 spool_path,
                 self.printer_name,
                 media_size_mm=media_size_mm,
                 copies=copies,
+                color_mode=color_mode,
             )
 
 
@@ -1564,6 +1645,8 @@ class MDNSAdvertiser:
 
         # Unique UUID per printer + machine so multiple PCs don't collide on AirPrint clients
         printer_uuid_str = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{self._printer_name}@{hostname}"))
+        color_capable = is_color_printer(self._printer_name)
+        urf_caps = "W8,SRGB24,V1.4,RS300-600,DM1" if color_capable else "W8,V1.4,RS300-600,DM1"
 
         txt_props = {
             "txtvers": "1",
@@ -1573,11 +1656,11 @@ class MDNSAdvertiser:
             "product": f"({self._printer_name})",
             "note": f"AirPrint Bridge on {hostname}",
             "pdl": "application/pdf,image/urf,image/jpeg,image/png,image/pwg-raster",
-            "Color": "T",                         # Must match SRGB24 in URF
+            "Color": "T" if color_capable else "F",  # Must match SRGB24 in URF
             "Duplex": "F",
             "adminurl": f"http://{self._host_ip}:{self._port}/",
             "priority": "50",
-            "URF": "W8,SRGB24,V1.4,RS300-600,DM1",
+            "URF": urf_caps,
             "UUID": printer_uuid_str,
             "TLS": "none",
         }

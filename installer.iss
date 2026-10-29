@@ -1,5 +1,5 @@
 #define MyAppName "AirPrint Bridge"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.4.1"
 #define MyAppPublisher "Salman Asmat"
 #define MyAppExeName "AirPrintBridge.exe"
 #define MyAppDir "C:\Program Files\AirPrintBridge"

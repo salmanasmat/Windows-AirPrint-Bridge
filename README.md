@@ -25,7 +25,7 @@ By strictly adhering to Apple AirPrint and standard IPP Everywhere requirements,
 - **Android:** Implemented via standard IPP Everywhere / Mopria specifications *(untested by the author; see [Android Testing Disclaimer](#android-configuration-important))*.
 
 > [!TIP]
-> **v1.4.0 Release Highlights:** v1.4.0 introduces multi-copy printing (honoring the "Number of Copies" counter from iOS/Android print sheets with proper collation), reverse page order printing (`N → 1` for face-up output tray printers such as Canon BJC-85), automatic rotation for landscape PDF pages to fit portrait paper (and vice-versa), and user configuration via `config.json`.
+> **v1.4.1 Release Highlights:** v1.4.1 fixes macOS creating grayscale-only print queues on color printers (Issue #6) by dynamically detecting Windows printer color capabilities (`DC_COLORDEVICE`), advertising `color-supported`, `print-color-mode-supported`, `print-color-mode-default`, and `pwg-raster-document-type-supported`, and honoring per-job `print-color-mode` requests (`color` vs `monochrome`) in Windows `DEVMODE` and page rasterization. It also includes all v1.4.0 features: multi-copy printing, reverse page order (`N → 1`), automatic landscape/portrait rotation, and `config.json`.
 
 ## Configuration (Optional)
 
@@ -71,7 +71,7 @@ To make your Windows printer discoverable on Android:
 
 The easiest way to install and run AirPrint Bridge on Windows is using the pre-compiled installer. **No Python installation or dependencies are required.** Everything is bundled into a self-contained background Windows Service that automatically starts when your PC boots.
 
-1. Download the latest `AirPrintBridge_Setup_v1.4.0.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
+1. Download the latest `AirPrintBridge_Setup_v1.4.1.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
 2. Run the installer as Administrator and follow the setup wizard.
 3. The AirPrint Bridge service will automatically start in the background.
 4. On your iOS or Android device (connected to the same Wi-Fi network), open a document or photo, tap **Print**, and select your Windows printer.

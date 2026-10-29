@@ -1,3 +1,12 @@
+## v1.4.1 - 2026-10-29
+
+### 🎨 macOS Color Queue & Per-Job Color Mode Support (Issue #6)
+- **Dynamic Printer Color Detection (`DC_COLORDEVICE`):** Added `is_color_printer()` to query the Windows printer driver's `DC_COLORDEVICE` capability (with a `DEVMODE.Color` fallback) rather than hardcoding `color-supported = false`.
+- **macOS Color Queue Fix (Issue #6):** Resolved an issue where macOS CUPS built a grayscale-only queue (`*ColorModel: *Gray`) for color printers. The IPP `Get-Printer-Attributes` response now advertises `color-supported = true`, `print-color-mode-supported = monochrome,color`, `print-color-mode-default = color`, and `pwg-raster-document-type-supported = sgray_8,srgb_8` when the printer supports color (and monochrome-only equivalents for monochrome printers).
+- **mDNS & URF Color Parity:** Synchronized mDNS TXT records (`Color=T`/`F` and `SRGB24` in `URF`) and IPP `urf-supported` with the detected hardware color capability.
+- **Per-Job `print-color-mode` Enforcement:** The `Print-Job` handler now extracts `print-color-mode` from the IPP request, configures `devmode.Color` (`DMCOLOR_COLOR` vs `DMCOLOR_MONOCHROME` with `DM_COLOR`), merges `DEVMODE` settings via `DocumentProperties()`, and converts rendered page rasters to grayscale when monochrome output is explicitly requested.
+- **Diagnostic Script Updates:** Updated `diagnose.py` and `decode_ipp.py` to check `print-color-mode-supported`, `print-color-mode-default`, and `pwg-raster-document-type-supported`.
+
 ## v1.4.0 - 2026-10-08
 
 ### 📄 Multi-Copy Printing & GitHub Feature Requests (#4 & #5)

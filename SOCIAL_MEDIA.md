@@ -1,3 +1,74 @@
+# Social Media Announcements — v1.4.1
+
+## LinkedIn Post
+
+Printing in full color from macOS and iOS to any Windows-connected printer just got a major upgrade! 🎨🖨️
+
+I'm happy to share that Windows AirPrint Bridge v1.4.1 is now live! 🚀
+
+A community member reported an interesting protocol quirk (Issue #6): while iOS printed in full color through the bridge, macOS built a grayscale-only print queue (*ColorModel: *Gray) for the exact same color laser printer.
+
+Why? Because iOS relied on SRGB24 in the URF capability header and ignored color-supported=false, whereas macOS CUPS strictly evaluated color-supported and print-color-mode-supported when generating the local queue.
+
+What's new in v1.4.1:
+- Dynamic Win32 Color Detection: Queries DeviceCapabilities(DC_COLORDEVICE) and DEVMODE to detect whether your Windows printer is color or monochrome.
+- Full macOS & IPP Everywhere Color Support: Advertises color-supported, print-color-mode-supported (monochrome, color), print-color-mode-default (color), and pwg-raster-document-type-supported (sgray_8, srgb_8).
+- Per-Job Color/Monochrome Switching: Honors the client's print-color-mode selection per job by configuring DMCOLOR_COLOR / DMCOLOR_MONOCHROME in the Windows DEVMODE structure and raster pipeline.
+- Consistent mDNS & URF Capabilities: Keeps Bonjour TXT records and IPP attributes 100% aligned for both color and monochrome printers.
+
+Download the standalone Windows installer or check out the source code on GitHub:
+https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest
+
+#OpenSource #Python #Windows #macOS #AirPrint #IPPEverywhere #Printing #SoftwareEngineering
+
+---
+
+## Reddit Post
+
+**Target Subreddits:** r/selfhosted, r/sysadmin, r/macsysadmin, r/windows, r/opensource, r/python
+
+**Title:** Windows AirPrint Bridge v1.4.1 — Fixes macOS grayscale-only queues on color printers + full per-job Color/Monochrome switching
+
+**Post Content:**
+
+Hey everyone!
+
+I maintain **Windows AirPrint Bridge**, a lightweight, open-source Python service that turns any Windows-connected USB or legacy printer into a native **AirPrint (iOS/macOS)** and **IPP Everywhere (Android/Mopria)** network printer.
+
+We just shipped **v1.4.1** to fix an interesting protocol discrepancy between iOS and macOS reported by the community ([Issue #6](https://github.com/salmanasmat/Windows-AirPrint-Bridge/issues/6)).
+
+### The Bug: Why iOS printed in Color while macOS locked the queue to Grayscale
+Previously, the bridge advertised `SRGB24` inside `urf-supported` and `Color=T` in the mDNS TXT record, but had `color-supported = false` hardcoded in the binary IPP `Get-Printer-Attributes` response and omitted `print-color-mode-supported`.
+- **iOS** saw `SRGB24` in `urf-supported` and happily sent color jobs.
+- **macOS (CUPS)** strictly respected `color-supported = false` and built a grayscale-only queue (`ColorModel/Color Mode: *Gray`).
+
+### What's New in v1.4.1:
+- **Dynamic Win32 Color Capability Detection:** Queries `win32print.DeviceCapabilities(printer_name, "", DC_COLORDEVICE)` (with a `DEVMODE` fallback) to determine whether the underlying Windows printer supports color.
+- **Complete IPP Color Attributes:** Dynamically advertises `color-supported`, `print-color-mode-supported` (`monochrome, color`), `print-color-mode-default` (`color`), and `pwg-raster-document-type-supported` (`sgray_8, srgb_8`).
+- **Per-Job Color & Monochrome Enforcement:** Reads `print-color-mode` from incoming IPP `Print-Job` requests, sets `DMCOLOR_COLOR` or `DMCOLOR_MONOCHROME` in the Windows `DEVMODE` (merged via `DocumentProperties`), and converts rendered page bitmaps to grayscale when monochrome is requested.
+- **mDNS & URF Consistency:** Automatically omits `SRGB24` and sets `Color=F` when sharing a monochrome-only printer.
+
+### Links:
+- **GitHub Repository & Source:** [https://github.com/salmanasmat/Windows-AirPrint-Bridge](https://github.com/salmanasmat/Windows-AirPrint-Bridge)
+- **Latest Installer (`AirPrintBridge_Setup_v1.4.1.exe`):** [https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest)
+
+Thanks to `@syeedmansur` for the detailed bug report and `ipptool` output! Feedback and test reports are always welcome.
+
+---
+
+## X (Twitter) Post
+
+Windows AirPrint Bridge v1.4.1 is out! 🎨🖨️
+
+Fixes macOS creating grayscale-only queues for color printers (#6):
+✅ Dynamic Win32 DC_COLORDEVICE detection
+✅ Full IPP print-color-mode & srgb_8 support
+✅ Per-job Color/Monochrome DEVMODE switching
+
+https://github.com/salmanasmat/Windows-AirPrint-Bridge
+
+---
+
 # Social Media Announcements — v1.2.0
 
 ## LinkedIn Post
