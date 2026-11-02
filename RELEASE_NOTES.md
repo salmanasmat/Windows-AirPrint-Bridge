@@ -1,3 +1,26 @@
+## v1.4.2 - 2026-11-02
+
+### 🚀 New Features
+- **Complete IPP `media-col-database` & Media Collection Support (Issue #10):** Implemented RFC 8010 collection encoding helpers to advertise `media-col-default`, `media-col-ready`, `media-size-supported`, `media-col-database`, `media-*-margin-supported`, `media-source-supported`, and `media-type-supported` in `Get-Printer-Attributes`. Resolves the macOS CUPS `_ppdCreateFromIPP` fallback where only US Letter (`*Letter`) appeared in the macOS paper size dropdown despite `media-supported` listing ISO A4/A5/A6 and label formats.
+- **Native PWG Raster (`image/pwg-raster`) Decoder (Issue #9):** Added `convert_pwg_to_pdf()` supporting PWG 5102.4 (`RaS2` magic header, 1796-byte page header, and PackBits compression) so standard IPP Everywhere clients sending `image/pwg-raster` render accurately alongside Apple URF (`image/urf`).
+- **Automated Windows Firewall Setup in Installer (Issue #8):** Added a checked-by-default `"Add Windows Firewall rules for AirPrint / IPP (TCP 631 & UDP 5353)"` task to the Inno Setup installer (`installer.iss`) with automatic cleanup on uninstall.
+- **Explicit Printer Override & Render DPI Cap (`config.json`):** Added `"printer_name"` (to pin a specific Windows printer name) and `"max_render_dpi"` (default `300`, clamped `72..1200`) to `config.json`.
+
+### ⚡ Improvements
+- **Session-0 Safe Default Printer Resolution (Issue #7):** Reworked `get_default_printer()` for the `NT AUTHORITY\SYSTEM` service context (`S-1-5-18`). The service now enumerates active user SIDs under `HKEY_USERS\<SID>\Software\Microsoft\Windows NT\CurrentVersion\Windows\Device` to read the interactive user's default printer, validates candidates against `win32print.EnumPrinters()` so deleted printers are never selected, and automatically deprioritizes virtual sinks (`Microsoft Print to PDF`, `XPS`, `OneNote`, `Fax`) in favor of physical hardware printers.
+- **Banded GDI Printing & Memory Optimization (Issue #9):** Capped default intermediate rasterization DPI at `300 DPI` (reducing a 600 DPI Letter page's uncompressed GDI payload from ~85.3 MB to ~21.3 MB) and replaced single-call full-page `Dib.draw()` with 256-row horizontal band transfers so USB inkjet GDI print processors (such as the Canon TS5000 series) never stall or drop multi-page jobs in the Windows spooler.
+- **Full IPP Orientation Support (`orientation-requested`, Issue #10):** Advertised `orientation-requested-default` (`3` = portrait) and `orientation-requested-supported` (`3, 4, 5, 6`), enhanced `extract_ipp_job_attributes()` to decode `IPP_TAG_ENUM` (`0x23`), and updated `spool_to_printer()` to apply requested landscape/reverse rotations and `DMORIENT_LANDSCAPE` / `DMORIENT_PORTRAIT` in the Windows `DEVMODE`.
+
+### 🐛 Bug Fixes
+- **Fixed Missing `win32con` Module Scope Import (Issue #10):** Imported `win32con`, `pywintypes`, and `winreg` at module scope in `airprint_bridge.py`, fixing a silent `NameError` inside `_build_printer_attributes()` that forced `media-default` to fall back to `na_letter_8.5x11in` even when the Windows printer was configured for ISO A4.
+- **Fixed URF PackBits Scanline & Channel Alignment Bugs (Issue #9):** Fixed `convert_urf_to_pdf()` so each scanline consumes its leading `line_repeat` byte (`count = line_repeat + 1`), `0x80` (`-128`) fills the remainder of the current scanline with white (`0xFF`), and `bpp` / `color_space` accurately select grayscale (`8 bpp`) vs RGB (`24 bpp`) or CMYK/RGBA (`32 bpp`).
+- **Fixed GDI `StretchDIBits` Scanline Skew on Non-4-Aligned Widths (Issue #9):** Padded both source and destination widths in `spool_to_printer()` to 4-pixel boundaries (`width % 4 == 0`), eliminating diagonal scanline shearing and RGB channel rotation when `PIL.ImageWin.Dib` passes unpadded RGB buffers to `StretchDIBits`.
+- **Fixed 3-Step `DocumentProperties` Driver `DEVMODE` Allocation (Issue #9):** Added `_get_printer_devmode()` using `win32print.DocumentProperties(..., DM_OUT_BUFFER)` to allocate the full driver-specific `DEVMODE` (including private `dmDriverExtra` bytes) required by Canon, Epson, and HP USB drivers.
+- **Advertised `Cancel-Job` & `Get-Job-Attributes` in `operations-supported` (Issue #10):** Added `0x0008` (`Cancel-Job`) and `0x0009` (`Get-Job-Attributes`) to `operations-supported` and aligned `media-ready` with the active default media.
+
+### 📚 Documentation
+- **Updated Diagnostics (`diagnose.py`) & `README.md`:** Added automated verification in `diagnose.py` for `media-col-default`, `media-size-supported`, `media-col-database`, `orientation-requested-supported`, and Windows Firewall rules; documented `printer_name` and `max_render_dpi` in `README.md`.
+
 ## v1.4.1 - 2026-10-29
 
 ### 🎨 macOS Color Queue & Per-Job Color Mode Support (Issue #6)

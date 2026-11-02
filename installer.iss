@@ -1,5 +1,5 @@
 #define MyAppName "AirPrint Bridge"
-#define MyAppVersion "1.4.1"
+#define MyAppVersion "1.4.2"
 #define MyAppPublisher "Salman Asmat"
 #define MyAppExeName "AirPrintBridge.exe"
 #define MyAppDir "C:\Program Files\AirPrintBridge"
@@ -19,16 +19,25 @@ PrivilegesRequired=admin
 CloseApplications=yes
 CloseApplicationsFilter=*AirPrintBridge*
 
+[Tasks]
+Name: "firewall"; Description: "Add Windows Firewall rules for AirPrint / IPP (TCP 631 & UDP 5353)"; GroupDescription: "Network Configuration:"
+
 [Files]
 Source: "dist\AirPrintBridge.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Run]
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""AirPrint Bridge - IPP (TCP 631)"""; Flags: runhidden waituntilterminated; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""AirPrint Bridge - mDNS (UDP 5353)"""; Flags: runhidden waituntilterminated; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""AirPrint Bridge - IPP (TCP 631)"" dir=in action=allow protocol=TCP localport=631 remoteip=localsubnet profile=any"; Flags: runhidden waituntilterminated; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""AirPrint Bridge - mDNS (UDP 5353)"" dir=in action=allow protocol=UDP localport=5353 remoteip=localsubnet profile=any"; Flags: runhidden waituntilterminated; Tasks: firewall
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--startup auto install"; Flags: runhidden waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Parameters: "start"; Flags: runhidden waituntilterminated
 
 [UninstallRun]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "stop"; Flags: runhidden waituntilterminated
-Filename: "{app}\{#MyAppExeName}"; Parameters: "remove"; Flags: runhidden waituntilterminated
+Filename: "{app}\{#MyAppExeName}"; Parameters: "stop"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
+Filename: "{app}\{#MyAppExeName}"; Parameters: "remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""AirPrint Bridge - IPP (TCP 631)"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveFirewallIPP"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""AirPrint Bridge - mDNS (UDP 5353)"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveFirewallMDNS"
 
 [UninstallDelete]
 Type: files; Name: "{app}\airprint_bridge.log"

@@ -25,14 +25,20 @@ By strictly adhering to Apple AirPrint and standard IPP Everywhere requirements,
 - **Android:** Implemented via standard IPP Everywhere / Mopria specifications *(untested by the author; see [Android Testing Disclaimer](#android-configuration-important))*.
 
 > [!TIP]
-> **v1.4.1 Release Highlights:** v1.4.1 fixes macOS creating grayscale-only print queues on color printers (Issue #6) by dynamically detecting Windows printer color capabilities (`DC_COLORDEVICE`), advertising `color-supported`, `print-color-mode-supported`, `print-color-mode-default`, and `pwg-raster-document-type-supported`, and honoring per-job `print-color-mode` requests (`color` vs `monochrome`) in Windows `DEVMODE` and page rasterization. It also includes all v1.4.0 features: multi-copy printing, reverse page order (`N → 1`), automatic landscape/portrait rotation, and `config.json`.
+> **v1.4.2 Release Highlights:**
+> - **Smart Default Printer Resolution (Issue #7):** Detects the logged-in user's default printer from `HKEY_USERS` even when running as the `SYSTEM` Windows Service, validates printers against `EnumPrinters` so deleted printers are never selected, automatically prefers physical printers over virtual printers (`Microsoft Print to PDF`), and adds an optional `"printer_name"` override in `config.json`.
+> - **Automatic Windows Firewall Rules in Installer (Issue #8):** The setup wizard now includes a built-in option to automatically configure inbound Windows Firewall rules for IPP (`TCP 631`) and mDNS (`UDP 5353`) on installation and remove them on uninstallation.
+> - **Banded GDI Rendering, 4-Pixel Stride Alignment & Raster Fixes (Issue #9):** Eliminates ~90 MB/page monolithic GDI `StretchDIBits` allocations by capping default rasterization at `300` DPI (`max_render_dpi` in `config.json`), aligning bitmap widths to 4-pixel boundaries to prevent 24-bit scanline shearing, drawing pages in 256-row horizontal bands, and fixing Apple URF / PWG Raster PackBits decoding.
+> - **Full macOS/CUPS Media Collection & Landscape Conformance (Issue #10):** Advertises `media-col-default`, `media-col-ready`, `media-size-supported`, `media-col-database`, `orientation-requested-supported`, and complete `operations-supported` so macOS exposes `A4` and all supported paper sizes natively and prints Landscape jobs accurately.
 
 ## Configuration (Optional)
 
-AirPrint Bridge automatically detects your network interface, default printer, and paper dimensions with zero configuration required. For advanced features, a `config.json` file is automatically created in the application directory on first launch:
+AirPrint Bridge automatically detects your network interface, default physical printer, and paper dimensions with zero configuration required. For advanced features, a `config.json` file is automatically created in the application directory on first launch:
 
 ```json
 {
+    "printer_name": "",
+    "max_render_dpi": 300,
     "reverse_page_order": false,
     "auto_rotate_to_fit": false
 }
@@ -40,6 +46,8 @@ AirPrint Bridge automatically detects your network interface, default printer, a
 
 | Setting | Default | Description |
 |---|---|---|
+| `printer_name` | `""` | Optional explicit Windows printer name to bridge. When empty (`""`), automatically selects the active user's default physical printer. |
+| `max_render_dpi` | `300` | Maximum rasterization DPI (clamped `72..1200`). Keeps GDI spool memory compact (~20 MB vs ~90 MB per page on 600 DPI inkjets) while preserving 1:1 physical scaling. |
 | `reverse_page_order` | `false` | When `true`, prints multi-page documents in reverse order (`N → 1`). Ideal for printers that output pages face-up so the resulting stack is ordered 1..N. |
 | `auto_rotate_to_fit` | `false` | When `true`, automatically rotates landscape PDF pages 90° clockwise to fit portrait paper (and vice-versa). Eliminates manual rotation on iOS which lacks an orientation dialog. |
 
@@ -71,7 +79,7 @@ To make your Windows printer discoverable on Android:
 
 The easiest way to install and run AirPrint Bridge on Windows is using the pre-compiled installer. **No Python installation or dependencies are required.** Everything is bundled into a self-contained background Windows Service that automatically starts when your PC boots.
 
-1. Download the latest `AirPrintBridge_Setup_v1.4.1.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
+1. Download the latest `AirPrintBridge_Setup_v1.4.2.exe` from the [Releases page](https://github.com/salmanasmat/Windows-AirPrint-Bridge/releases/latest).
 2. Run the installer as Administrator and follow the setup wizard.
 3. The AirPrint Bridge service will automatically start in the background.
 4. On your iOS or Android device (connected to the same Wi-Fi network), open a document or photo, tap **Print**, and select your Windows printer.

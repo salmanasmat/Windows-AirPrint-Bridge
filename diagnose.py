@@ -137,6 +137,10 @@ try:
             b"print-color-mode-supported": "print-color-mode-supported",
             b"print-color-mode-default": "print-color-mode-default",
             b"pwg-raster-document-type-supported": "pwg-raster-document-type-supported",
+            b"media-col-default": "media-col-default (macOS/CUPS media sizing)",
+            b"media-size-supported": "media-size-supported (macOS/CUPS media sizing)",
+            b"media-col-database": "media-col-database (IPP Everywhere media DB)",
+            b"orientation-requested-supported": "orientation-requested-supported (Landscape support)",
             b"urf-supported": "urf-supported",
             b"printer-uuid": "printer-uuid",
             b"printer-more-info": "printer-more-info",
@@ -196,3 +200,14 @@ print(f"  UDP 5353 (mDNS): {'✅ Active' if mdns_port else '❌ Not found'}")
 
 ipp_port = ":631" in result.stdout
 print(f"  TCP 631 (IPP):   {'✅ Listening' if ipp_port else '❌ Not listening'}")
+
+fw_ipp = subprocess.run(
+    ["netsh", "advfirewall", "firewall", "show", "rule", "name=AirPrint Bridge - IPP (TCP 631)"],
+    capture_output=True, text=True
+)
+fw_mdns = subprocess.run(
+    ["netsh", "advfirewall", "firewall", "show", "rule", "name=AirPrint Bridge - mDNS (UDP 5353)"],
+    capture_output=True, text=True
+)
+print(f"  Firewall IPP:    {'✅ Allowed' if fw_ipp.returncode == 0 else '⚠️ Rule not found'}")
+print(f"  Firewall mDNS:   {'✅ Allowed' if fw_mdns.returncode == 0 else '⚠️ Rule not found'}")

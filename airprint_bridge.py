@@ -35,9 +35,10 @@ import tempfile
 import threading
 import time
 import uuid
+import winreg
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Third-party imports
@@ -51,7 +52,9 @@ except ImportError:
     )
 
 try:
+    import pywintypes
     import win32api
+    import win32con
     import win32gui
     import win32print
     import win32serviceutil
@@ -67,7 +70,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION: str = "1.4.1"
+VERSION: str = "1.4.2"
 IPP_PORT: int = 631
 IPP_SERVICE_TYPE: str = "_ipp._tcp.local."
 
@@ -119,6 +122,7 @@ MAGIC_PDF: bytes = b"%PDF"
 MAGIC_JPEG: bytes = b"\xFF\xD8\xFF"
 MAGIC_PNG: bytes = b"\x89PNG"
 MAGIC_URF: bytes = b"UNIRAST"   # Apple Raster (URF) format
+MAGIC_PWG: bytes = b"RaS2"      # PWG Raster format
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -153,13 +157,15 @@ logging.getLogger().handlers = []
 # ---------------------------------------------------------------------------
 CONFIG_FILE: Path = _app_dir / "config.json"
 
-_CONFIG_DEFAULTS: dict[str, bool] = {
+_CONFIG_DEFAULTS: dict[str, Any] = {
+    "printer_name": "",
+    "max_render_dpi": 300,
     "reverse_page_order": False,
     "auto_rotate_to_fit": False,
 }
 
 
-def load_config() -> dict[str, bool]:
+def load_config() -> dict[str, Any]:
     """Load config.json, creating it with defaults if it doesn't exist."""
     if CONFIG_FILE.exists():
         try:
@@ -209,6 +215,8 @@ def detect_file_type(data: bytes) -> Tuple[str, str]:
         return ".pdf", "application/pdf"
     if data[:7] == MAGIC_URF:
         return ".urf", "image/urf"
+    if data[:4] == MAGIC_PWG:
+        return ".pwg", "image/pwg-raster"
     if data[:3] == MAGIC_JPEG:
         return ".jpg", "image/jpeg"
     if data[:4] == MAGIC_PNG:
@@ -216,127 +224,150 @@ def detect_file_type(data: bytes) -> Tuple[str, str]:
     return ".bin", "application/octet-stream"
 
 
+def _decode_packbits_raster_page(
+    data: bytes,
+    offset: int,
+    width: int,
+    height: int,
+    channels: int,
+    fill_byte: int = 0xFF,
+) -> Tuple[bytes, int]:
+    """
+    Decode a single URF or PWG Raster page encoded with per-line repeat counts
+    and PackBits RLE pixel runs.
+
+    Per the Apple URF / PWG 5102.4 specification:
+    - Each scanline starts with a 1-byte ``line_repeat`` count; the decoded row
+      is repeated ``line_repeat + 1`` times.
+    - Within a scanline, each control byte ``code`` means:
+      - ``0x00..0x7F`` (0..127): repeat the next 1 pixel ``code + 1`` times.
+      - ``0x80`` (128): fill the remainder of the current scanline with white
+        (``fill_byte``).
+      - ``0x81..0xFF`` (129..255): copy ``(257 - code)`` literal pixels.
+    """
+    row_bytes = width * channels
+    page_data = bytearray()
+    rows_decoded = 0
+    fill_pixel = bytes([fill_byte]) * channels
+
+    while rows_decoded < height and offset < len(data):
+        line_repeat = data[offset] + 1
+        offset += 1
+
+        row = bytearray()
+        while len(row) < row_bytes and offset < len(data):
+            code = data[offset]
+            offset += 1
+            if code == 0x80:
+                # Fill remainder of scanline with white/background
+                remaining_pixels = (row_bytes - len(row)) // channels
+                if remaining_pixels > 0:
+                    row.extend(fill_pixel * remaining_pixels)
+                break
+            elif code <= 0x7F:
+                repeat_count = code + 1
+                if offset + channels > len(data):
+                    break
+                pixel = data[offset:offset + channels]
+                offset += channels
+                row.extend(pixel * repeat_count)
+            else:
+                literal_count = 257 - code
+                literal_bytes = literal_count * channels
+                if offset + literal_bytes > len(data):
+                    avail = len(data) - offset
+                    row.extend(data[offset:offset + avail])
+                    offset = len(data)
+                    break
+                row.extend(data[offset:offset + literal_bytes])
+                offset += literal_bytes
+
+        if len(row) < row_bytes:
+            row.extend(bytes([fill_byte]) * (row_bytes - len(row)))
+        elif len(row) > row_bytes:
+            del row[row_bytes:]
+
+        repeat_actual = min(line_repeat, height - rows_decoded)
+        for _ in range(repeat_actual):
+            page_data.extend(row)
+        rows_decoded += repeat_actual
+
+    return bytes(page_data), offset
+
+
 def convert_urf_to_pdf(urf_path: str) -> str:
     """
     Convert an Apple Raster (URF) file to PDF so Windows can print it.
 
-    URF format: 'UNIRAST\x00' (8-byte header) followed by one or more
-    page records.  Each page record has a 4-byte big-endian page header
-    length, then pixel data.  We extract page images and compose them
-    into a simple PDF.
-
-    If the ``Pillow`` library is available, we decode the raster pages
-    into images and wrap them in a PDF.  Otherwise, we fall back to
-    writing raw bytes as a single-page PDF image.
+    URF format: 'UNIRAST\\x00' (8-byte header) followed by a 4-byte BE page
+    count and one or more page records (each starting with a 32-byte header).
     """
     pdf_path = urf_path.rsplit(".", 1)[0] + ".pdf"
     try:
-        # Attempt conversion with Pillow (best quality)
         from PIL import Image
-        import io
 
         with open(urf_path, "rb") as f:
             data = f.read()
 
-        # URF header: 'UNIRAST\x00' (8 bytes) then page count (4 bytes BE)
         if len(data) < 12 or data[:8] != b"UNIRAST\x00":
             logger.warning("URF file has invalid header, treating as raw")
             return urf_path
 
-        # Skip the 8-byte magic + 4-byte page count to the page data.
-        # Each page has a 32-byte page header, then raw pixel data.
-        # For a simpler approach, we try to find embedded JPEG or image data.
-        offset = 12  # past magic + page count
-
+        offset = 12  # past 8-byte magic + 4-byte page count
         images = []
-        while offset < len(data):
-            # Page header is typically 32 bytes
-            if offset + 32 > len(data):
-                break
-            # Bytes 16-19: width (BE), bytes 20-23: height (BE)
-            # Byte 0: bits per pixel / color space info
+        last_dpi = 300
+
+        while offset + 32 <= len(data):
             page_header = data[offset:offset + 32]
-            bpp = page_header[0]  # bits per component
-            color_space = page_header[1]  # 1=sGray, 3=sRGB
-            # Duplex/quality fields at bytes 2,3
+            bpp = page_header[0]          # 8=Gray, 24=RGB, 32=RGBA/CMYK
+            color_space = page_header[1]  # 0=sGray, 1=sRGB, 3=AdobeRGB
+            dpi = struct.unpack("!I", page_header[8:12])[0] or 300
             width = struct.unpack("!I", page_header[16:20])[0]
             height = struct.unpack("!I", page_header[20:24])[0]
-            # Resolution at bytes 8-11 (dpi)
-            dpi = struct.unpack("!I", page_header[8:12])[0]
-            if dpi == 0:
-                dpi = 300
+            offset += 32
 
-            offset += 32  # advance past page header
+            if width == 0 or height == 0:
+                break
 
-            # Determine channels and bytes per pixel
-            if color_space == 1:
+            last_dpi = dpi
+            if bpp == 8 or color_space == 0:
                 channels = 1
                 mode = "L"
+            elif bpp == 32:
+                channels = 4
+                mode = "RGBA"
             else:
                 channels = 3
                 mode = "RGB"
 
+            page_bytes, offset = _decode_packbits_raster_page(
+                data, offset, width, height, channels, fill_byte=0xFF
+            )
             row_bytes = width * channels
-            page_data = bytearray()
-
-            # URF uses a simple run-length encoding per row
-            for _row in range(height):
-                if offset >= len(data):
-                    break
-                row = bytearray()
-                while len(row) < row_bytes:
-                    if offset >= len(data):
-                        break
-                    count_byte = data[offset]
-                    offset += 1
-                    if count_byte == 0:
-                        # Repeat the next pixel (count+1) times
-                        # count_byte 0 = 1 repeat of next pixel
-                        if offset + channels > len(data):
-                            break
-                        pixel = data[offset:offset + channels]
-                        offset += channels
-                        row.extend(pixel)
-                    elif count_byte <= 127:
-                        # Repeat next pixel (count_byte + 1) times
-                        if offset + channels > len(data):
-                            break
-                        pixel = data[offset:offset + channels]
-                        offset += channels
-                        row.extend(pixel * (count_byte + 1))
-                    else:
-                        # (257 - count_byte) literal pixels follow
-                        literal_count = 257 - count_byte
-                        literal_bytes = literal_count * channels
-                        if offset + literal_bytes > len(data):
-                            break
-                        row.extend(data[offset:offset + literal_bytes])
-                        offset += literal_bytes
-                # Pad or truncate to exact row width
-                page_data.extend(row[:row_bytes])
-
-            if width > 0 and height > 0 and len(page_data) >= row_bytes:
-                actual_height = min(height, len(page_data) // row_bytes)
+            if len(page_bytes) >= row_bytes:
+                actual_height = min(height, len(page_bytes) // row_bytes)
                 img = Image.frombytes(
-                    mode, (width, actual_height),
-                    bytes(page_data[:actual_height * row_bytes]),
+                    mode,
+                    (width, actual_height),
+                    page_bytes[:actual_height * row_bytes],
                 )
+                if mode == "RGBA":
+                    img = img.convert("RGB")
                 images.append(img)
                 logger.info(
-                    "URF page decoded: %dx%d %s @ %d dpi",
-                    width, actual_height, mode, dpi,
+                    "URF page decoded: %dx%d %s (bpp=%d, cs=%d) @ %d dpi",
+                    width, actual_height, mode, bpp, color_space, dpi,
                 )
 
         if images:
-            # Save all pages as a multi-page PDF
             first = images[0]
             if len(images) > 1:
                 first.save(
                     pdf_path, "PDF", save_all=True,
-                    append_images=images[1:], resolution=dpi,
+                    append_images=images[1:], resolution=last_dpi,
                 )
             else:
-                first.save(pdf_path, "PDF", resolution=dpi)
+                first.save(pdf_path, "PDF", resolution=last_dpi)
             logger.info("URF converted to PDF: %s (%d pages)", pdf_path, len(images))
             return pdf_path
 
@@ -348,22 +379,281 @@ def convert_urf_to_pdf(urf_path: str) -> str:
     except Exception:
         logger.exception("URF→PDF conversion failed")
 
-    # Fallback: return original URF path (ShellExecute may still work
-    # if the user has a URF-capable viewer installed)
     return urf_path
 
 
+def convert_pwg_to_pdf(pwg_path: str) -> str:
+    """
+    Convert a PWG Raster ('RaS2') file to PDF so Windows can print it.
+
+    PWG Raster format (PWG 5102.4): 4-byte 'RaS2' magic followed by one or
+    more pages, each with a 1796-byte page header and PackBits-encoded rows.
+    """
+    pdf_path = pwg_path.rsplit(".", 1)[0] + ".pdf"
+    try:
+        from PIL import Image
+
+        with open(pwg_path, "rb") as f:
+            data = f.read()
+
+        if len(data) < 1800 or data[:4] != MAGIC_PWG:
+            logger.warning("PWG Raster file has invalid header, treating as raw")
+            return pwg_path
+
+        offset = 4
+        images = []
+        last_dpi = 300
+
+        while offset + 1796 <= len(data):
+            hdr = data[offset:offset + 1796]
+            dpi_x = struct.unpack("!I", hdr[276:280])[0] or 300
+            width = struct.unpack("!I", hdr[372:376])[0]
+            height = struct.unpack("!I", hdr[376:380])[0]
+            bpp = struct.unpack("!I", hdr[388:392])[0]
+            color_space = struct.unpack("!I", hdr[400:404])[0]
+            offset += 1796
+
+            if width == 0 or height == 0:
+                break
+
+            last_dpi = dpi_x
+            if bpp == 8:
+                channels = 1
+                mode = "L"
+                # ColorSpace 3 = Black (0=white, 255=black); 18 = sGray (255=white)
+                fill_byte = 0x00 if color_space == 3 else 0xFF
+            elif bpp == 32:
+                channels = 4
+                mode = "RGBA"
+                fill_byte = 0xFF
+            else:
+                channels = 3
+                mode = "RGB"
+                fill_byte = 0xFF
+
+            page_bytes, offset = _decode_packbits_raster_page(
+                data, offset, width, height, channels, fill_byte=fill_byte
+            )
+            row_bytes = width * channels
+            if len(page_bytes) >= row_bytes:
+                actual_height = min(height, len(page_bytes) // row_bytes)
+                img = Image.frombytes(
+                    mode,
+                    (width, actual_height),
+                    page_bytes[:actual_height * row_bytes],
+                )
+                if mode == "L" and color_space == 3:
+                    from PIL import ImageOps
+                    img = ImageOps.invert(img)
+                elif mode == "RGBA":
+                    img = img.convert("RGB")
+                images.append(img)
+                logger.info(
+                    "PWG page decoded: %dx%d %s (bpp=%d, cs=%d) @ %d dpi",
+                    width, actual_height, mode, bpp, color_space, dpi_x,
+                )
+
+        if images:
+            first = images[0]
+            if len(images) > 1:
+                first.save(
+                    pdf_path, "PDF", save_all=True,
+                    append_images=images[1:], resolution=last_dpi,
+                )
+            else:
+                first.save(pdf_path, "PDF", resolution=last_dpi)
+            logger.info("PWG Raster converted to PDF: %s (%d pages)", pdf_path, len(images))
+            return pdf_path
+
+    except Exception:
+        logger.exception("PWG→PDF conversion failed")
+
+    return pwg_path
+
+
+_VIRTUAL_PRINTER_PREFIXES: Tuple[str, ...] = (
+    "microsoft print to pdf",
+    "microsoft xps document writer",
+    "onenote",
+    "send to onenote",
+    "fax",
+)
+
+
+def _is_virtual_printer(name: str) -> bool:
+    """Return True if *name* is a built-in Windows virtual/non-physical printer."""
+    lower = name.strip().lower()
+    return any(lower.startswith(prefix) for prefix in _VIRTUAL_PRINTER_PREFIXES)
+
+
+def _get_installed_printers() -> list[str]:
+    """Return a list of all currently installed local and network printers."""
+    printers: list[str] = []
+    try:
+        flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+        for entry in win32print.EnumPrinters(flags):
+            if len(entry) > 2 and entry[2]:
+                printers.append(entry[2])
+    except Exception:
+        logger.debug("EnumPrinters failed", exc_info=True)
+    return printers
+
+
+def _get_user_registry_default_printers() -> list[str]:
+    """
+    Inspect interactive user profiles in ``HKEY_USERS\\<S-1-5-21-*>`` to find
+    the logged-in user's default printer when running as the ``SYSTEM`` service
+    (Issue #7).
+    """
+    results: list[str] = []
+    try:
+        idx = 0
+        while True:
+            try:
+                sid = winreg.EnumKey(winreg.HKEY_USERS, idx)
+                idx += 1
+            except OSError:
+                break
+            if not sid.startswith("S-1-5-21-") or sid.endswith("_Classes"):
+                continue
+            subkey_path = f"{sid}\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows"
+            try:
+                with winreg.OpenKey(winreg.HKEY_USERS, subkey_path, 0, winreg.KEY_READ) as k:
+                    device_val, _ = winreg.QueryValueEx(k, "Device")
+                    if isinstance(device_val, str) and device_val.strip():
+                        printer_name = device_val.split(",")[0].strip()
+                        if printer_name and printer_name not in results:
+                            results.append(printer_name)
+            except OSError:
+                continue
+    except Exception:
+        logger.debug("Could not query HKEY_USERS for user default printer", exc_info=True)
+    return results
+
+
 def get_default_printer() -> str:
-    """Return the name of the Windows default printer."""
-    name: str = win32print.GetDefaultPrinter()
-    logger.info("Default Windows printer: %s", name)
-    return name
+    """
+    Resolve the target Windows printer name (Issue #7).
+
+    Priority:
+    1. Explicit ``printer_name`` in ``config.json`` (if set).
+    2. Interactive user's default printer from ``HKEY_USERS\\<S-1-5-21-*>``
+       (avoids ``NT AUTHORITY\\SYSTEM`` registry staying stuck on
+       ``Microsoft Print to PDF`` when running as a Windows Service).
+    3. ``win32print.GetDefaultPrinterW()`` / ``GetDefaultPrinter()``.
+    4. Validates against ``EnumPrinters`` so deleted printers are never chosen,
+       and prefers physical printers over built-in Windows virtual printers.
+    """
+    config = load_config()
+    installed = _get_installed_printers()
+    installed_map = {p.lower(): p for p in installed}
+    if installed:
+        logger.info("Installed Windows printers: %s", installed)
+
+    # 1. Explicit config override
+    configured_name = str(config.get("printer_name", "") or "").strip()
+    if configured_name:
+        if configured_name.lower() in installed_map:
+            resolved = installed_map[configured_name.lower()]
+            logger.info("Using printer configured in config.json: %s", resolved)
+            return resolved
+        logger.warning(
+            "Configured printer '%s' not found in installed printers %s",
+            configured_name, installed,
+        )
+        if not installed:
+            return configured_name
+
+    # 2. Collect default printer candidates (interactive user SIDs first, then current context)
+    candidates: list[str] = []
+    for reg_printer in _get_user_registry_default_printers():
+        if reg_printer not in candidates:
+            candidates.append(reg_printer)
+
+    for getter_name in ("GetDefaultPrinterW", "GetDefaultPrinter"):
+        getter = getattr(win32print, getter_name, None)
+        if callable(getter):
+            try:
+                p = getter()
+                if p and p not in candidates:
+                    candidates.append(p)
+            except Exception:
+                pass
+
+    logger.debug("Default printer candidates: %s", candidates)
+
+    # Filter candidates to printers that actually exist on the system
+    if installed:
+        valid_candidates = [
+            installed_map[c.lower()]
+            for c in candidates
+            if c.lower() in installed_map
+        ]
+    else:
+        valid_candidates = list(candidates)
+
+    # Prefer a non-virtual candidate
+    for cand in valid_candidates:
+        if not _is_virtual_printer(cand):
+            logger.info("Default Windows printer: %s", cand)
+            return cand
+
+    # If the default candidate is virtual (e.g. Microsoft Print to PDF) or was
+    # deleted, check if a real physical printer is installed and prefer it.
+    physical_installed = [p for p in installed if not _is_virtual_printer(p)]
+    if physical_installed:
+        chosen = physical_installed[0]
+        logger.info(
+            "Default printer candidate (%s) is virtual or missing; "
+            "selected installed physical printer: %s",
+            candidates[0] if candidates else "none",
+            chosen,
+        )
+        return chosen
+
+    if valid_candidates:
+        logger.info("Default Windows printer (virtual fallback): %s", valid_candidates[0])
+        return valid_candidates[0]
+
+    if installed:
+        logger.info("Default Windows printer (installed fallback): %s", installed[0])
+        return installed[0]
+
+    fallback = candidates[0] if candidates else ""
+    logger.info("Default Windows printer: %s", fallback)
+    return fallback
+
+
+def _get_printer_devmode(hprinter: int, printer_name: str):
+    """
+    Retrieve a complete driver-initialized ``PyDEVMODE`` for *printer_name*
+    using the 3-step Win32 ``DocumentProperties`` sequence, falling back to
+    ``GetPrinter(hprinter, 2)``.
+    """
+    try:
+        size = win32print.DocumentProperties(0, hprinter, printer_name, None, None, 0)
+        if size > 0:
+            base_size = pywintypes.DEVMODEType().Size
+            extra = max(0, size - base_size)
+            dm = pywintypes.DEVMODEType(extra)
+            res = win32print.DocumentProperties(
+                0, hprinter, printer_name, dm, None, win32con.DM_OUT_BUFFER
+            )
+            if res >= 0:
+                return dm
+    except Exception:
+        logger.debug("DocumentProperties(DM_OUT_BUFFER) failed for '%s'", printer_name)
+
+    try:
+        props = win32print.GetPrinter(hprinter, 2)
+        return props.get("pDevMode")
+    except Exception:
+        return None
 
 
 def is_color_printer(printer_name: str) -> bool:
     """Return True if the Windows printer supports color printing."""
     try:
-        import win32con
         dc_colordevice = getattr(win32con, "DC_COLORDEVICE", 32)
         res = win32print.DeviceCapabilities(printer_name, "", dc_colordevice)
         if res >= 0:
@@ -377,11 +667,9 @@ def is_color_printer(printer_name: str) -> bool:
         logger.debug("DeviceCapabilities(DC_COLORDEVICE) failed for '%s'", printer_name)
 
     try:
-        import win32con
         hprinter = win32print.OpenPrinter(printer_name)
         try:
-            props = win32print.GetPrinter(hprinter, 2)
-            devmode = props.get("pDevMode")
+            devmode = _get_printer_devmode(hprinter, printer_name)
             if devmode is not None and (devmode.Fields & win32con.DM_COLOR):
                 return devmode.Color == win32con.DMCOLOR_COLOR
         finally:
@@ -406,27 +694,31 @@ def spool_to_printer(
     media_size_mm: Optional[Tuple[float, float]] = None,
     copies: int = 1,
     color_mode: Optional[str] = None,
+    orientation_requested: Optional[int] = None,
+    job_name: Optional[str] = None,
 ) -> None:
     """
     Send *file_path* to the Windows print queue of *printer_name*.
 
-    Uses PyMuPDF to rasterize the PDF and win32ui / win32gui to send it
-    directly to the printer's Device Context (DC) configured for the
-    correct physical paper size, color mode, and requested copies.
+    Uses PyMuPDF to rasterize the document and win32ui / win32gui to send it
+    in 4-pixel-aligned horizontal bands to the printer's Device Context (DC)
+    configured for the target physical paper size, orientation, color mode,
+    and requested copies.
     """
     copies = max(1, min(99, int(copies)))
     normalized_color_mode = color_mode.strip().lower() if color_mode else None
     is_monochrome = normalized_color_mode in _MONOCHROME_MODES
     logger.info(
-        "Spooling '%s' to printer '%s' (copies=%d, color_mode=%s)",
-        file_path, printer_name, copies, normalized_color_mode or "default",
+        "Spooling '%s' to printer '%s' (copies=%d, color_mode=%s, orientation=%s)",
+        file_path,
+        printer_name,
+        copies,
+        normalized_color_mode or "default",
+        orientation_requested or "auto",
     )
 
     try:
-        import win32print
-        import win32gui
         import win32ui
-        import win32con
         import pythoncom
         import fitz
         from PIL import Image, ImageWin
@@ -436,22 +728,32 @@ def spool_to_printer(
 
     pythoncom.CoInitialize()
     try:
-        # Auto-detect media size from PDF document if not explicitly supplied
-        if media_size_mm is None and file_path.lower().endswith(".pdf"):
-            try:
-                _inspect_doc = fitz.open(file_path)
-                if len(_inspect_doc) > 0:
-                    _p0 = _inspect_doc.load_page(0)
-                    _pdf_w_mm = _p0.rect.width * 25.4 / 72.0
-                    _pdf_h_mm = _p0.rect.height * 25.4 / 72.0
+        config = load_config()
+        reverse_page_order = bool(config.get("reverse_page_order", False))
+        auto_rotate_to_fit = bool(config.get("auto_rotate_to_fit", False))
+        try:
+            max_render_dpi = max(72, min(1200, int(config.get("max_render_dpi", 300) or 300)))
+        except (ValueError, TypeError):
+            max_render_dpi = 300
+
+        # Inspect document first page for media auto-detection and landscape orientation
+        doc_is_landscape = False
+        try:
+            _inspect_doc = fitz.open(file_path)
+            if len(_inspect_doc) > 0:
+                _p0 = _inspect_doc.load_page(0)
+                _pdf_w_mm = _p0.rect.width * 25.4 / 72.0
+                _pdf_h_mm = _p0.rect.height * 25.4 / 72.0
+                doc_is_landscape = _p0.rect.width > _p0.rect.height
+                if media_size_mm is None:
                     media_size_mm = (_pdf_w_mm, _pdf_h_mm)
                     logger.info(
-                        "No IPP media specified — auto-detected media size from PDF: %.1f × %.1f mm",
+                        "No IPP media specified — auto-detected media size from document: %.1f × %.1f mm",
                         _pdf_w_mm, _pdf_h_mm,
                     )
-                _inspect_doc.close()
-            except Exception:
-                logger.exception("Failed to auto-detect media size from PDF")
+            _inspect_doc.close()
+        except Exception:
+            logger.exception("Failed to inspect document dimensions")
 
         if media_size_mm:
             logger.info(
@@ -459,16 +761,26 @@ def spool_to_printer(
                 media_size_mm[0], media_size_mm[1],
             )
 
+        # Determine whether the print job is requesting Landscape orientation (Issue #10)
+        # IPP orientation-requested enum: 3=portrait, 4=landscape, 5=reverse-landscape, 6=reverse-portrait
+        want_landscape = False
+        if orientation_requested in (4, 5):
+            want_landscape = True
+        elif orientation_requested in (3, 6):
+            want_landscape = doc_is_landscape and not auto_rotate_to_fit
+        elif media_size_mm and media_size_mm[0] > media_size_mm[1]:
+            want_landscape = True
+        elif doc_is_landscape and not auto_rotate_to_fit:
+            want_landscape = True
+
         hprinter = win32print.OpenPrinter(printer_name)
         try:
             # ----------------------------------------------------------
             # Configure DEVMODE to match target paper size, color & copy
             # ----------------------------------------------------------
-            devmode = None
-            try:
-                props = win32print.GetPrinter(hprinter, 2)
-                devmode = props.get("pDevMode")
-                if devmode is not None:
+            devmode = _get_printer_devmode(hprinter, printer_name)
+            if devmode is not None:
+                try:
                     # Enforce single copy in hardware DEVMODE so driver doesn't
                     # multiply our software collated copy loop.
                     devmode.Copies = 1
@@ -485,20 +797,16 @@ def spool_to_printer(
                         devmode.Color = win32con.DMCOLOR_COLOR
                         devmode.Fields |= win32con.DM_COLOR
                         logger.info("DEVMODE Color set to DMCOLOR_COLOR (2)")
-            except Exception:
-                logger.debug("Could not retrieve base DEVMODE")
 
-            if devmode is not None:
-                try:
+                    # Configure orientation (Issue #10)
+                    if want_landscape:
+                        devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+                    else:
+                        devmode.Orientation = win32con.DMORIENT_PORTRAIT
+                    devmode.Fields |= win32con.DM_ORIENTATION
+
                     if media_size_mm:
                         width_mm, height_mm = media_size_mm
-
-                        # Set orientation: Landscape if wider than tall, else Portrait
-                        if width_mm > height_mm:
-                            devmode.Orientation = win32con.DMORIENT_LANDSCAPE
-                        else:
-                            devmode.Orientation = win32con.DMORIENT_PORTRAIT
-                        devmode.Fields |= win32con.DM_ORIENTATION
 
                         # Search printer's supported paper forms for a size match
                         matched_id = None
@@ -546,8 +854,10 @@ def spool_to_printer(
                             devmode.Fields |= win32con.DM_PAPERSIZE
                         else:
                             devmode.PaperSize = 256  # DMPAPER_USER (custom)
-                            devmode.PaperWidth = int(round(width_mm * 10))
-                            devmode.PaperLength = int(round(height_mm * 10))
+                            short_mm = min(width_mm, height_mm)
+                            long_mm = max(width_mm, height_mm)
+                            devmode.PaperWidth = int(round(short_mm * 10))
+                            devmode.PaperLength = int(round(long_mm * 10))
                             devmode.Fields |= (
                                 win32con.DM_PAPERSIZE
                                 | win32con.DM_PAPERWIDTH
@@ -594,40 +904,35 @@ def spool_to_printer(
 
             printer_dpi_x = hdc.GetDeviceCaps(win32con.LOGPIXELSX)
             printer_dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
-            logger.info("Printer DPI: %d × %d", printer_dpi_x, printer_dpi_y)
-
-            config = load_config()
-            reverse_page_order = bool(config.get("reverse_page_order", False))
-            auto_rotate_to_fit = bool(config.get("auto_rotate_to_fit", False))
+            render_dpi_x = min(printer_dpi_x, max_render_dpi)
+            render_dpi_y = min(printer_dpi_y, max_render_dpi)
+            logger.info(
+                "Printer DPI: %d × %d (rasterizing at %d × %d DPI)",
+                printer_dpi_x, printer_dpi_y, render_dpi_x, render_dpi_y,
+            )
 
             pdf_doc = fitz.open(file_path)
             page_count = len(pdf_doc)
 
-            # Pre-pass: auto-rotate landscape/portrait pages to match paper if enabled (Issue #5)
-            if auto_rotate_to_fit and page_count > 0:
-                paper_is_portrait = True
-                if devmode is not None and getattr(devmode, "Orientation", None):
-                    paper_is_portrait = (devmode.Orientation == win32con.DMORIENT_PORTRAIT)
-                else:
-                    dc_w = hdc.GetDeviceCaps(win32con.HORZRES)
-                    dc_h = hdc.GetDeviceCaps(win32con.VERTRES)
-                    paper_is_portrait = (dc_h >= dc_w)
+            # Pre-pass: align page rotation with target orientation / paper (Issues #5 & #10)
+            if page_count > 0:
+                dc_w = hdc.GetDeviceCaps(win32con.HORZRES)
+                dc_h = hdc.GetDeviceCaps(win32con.VERTRES)
+                dc_is_landscape = dc_w > dc_h
 
                 for pno in range(page_count):
                     p = pdf_doc.load_page(pno)
+                    if orientation_requested == 6:
+                        p.set_rotation((p.rotation + 180) % 360)
                     is_page_landscape = p.rect.width > p.rect.height
-                    if is_page_landscape and paper_is_portrait:
-                        p.set_rotation((p.rotation + 90) % 360)
-                        logger.info(
-                            "Auto-rotated page %d (landscape -> 90° CW to fit portrait paper)",
-                            pno + 1,
-                        )
-                    elif not is_page_landscape and not paper_is_portrait:
-                        p.set_rotation((p.rotation + 90) % 360)
-                        logger.info(
-                            "Auto-rotated page %d (portrait -> 90° CW to fit landscape paper)",
-                            pno + 1,
-                        )
+                    if auto_rotate_to_fit or orientation_requested in (4, 5) or want_landscape:
+                        if is_page_landscape != dc_is_landscape:
+                            rot_delta = 270 if orientation_requested == 5 else 90
+                            p.set_rotation((p.rotation + rot_delta) % 360)
+                            logger.info(
+                                "Rotated page %d (%d° CW) to match printer DC orientation (dc_landscape=%s)",
+                                pno + 1, rot_delta, dc_is_landscape,
+                            )
 
             # Determine page sequence (Issue #4)
             if reverse_page_order:
@@ -639,7 +944,8 @@ def spool_to_printer(
             else:
                 page_indices = list(range(page_count))
 
-            hdc.StartDoc(file_path)
+            doc_title = (job_name or "").strip() or os.path.basename(file_path)
+            hdc.StartDoc(doc_title)
 
             for copy_idx in range(copies):
                 if copies > 1:
@@ -663,52 +969,78 @@ def spool_to_printer(
                     )
 
                     # --------------------------------------------------
-                    # DPI-based scaling: render at native printer DPI
-                    # (1 PDF pt = DPI/72 pixels).
+                    # Compute 1:1 physical target size in Printer DC px
                     # --------------------------------------------------
-                    dpi_scale_x = printer_dpi_x / 72.0
-                    dpi_scale_y = printer_dpi_y / 72.0
+                    dc_scale_x = printer_dpi_x / 72.0
+                    dc_scale_y = printer_dpi_y / 72.0
 
-                    rendered_w = page.rect.width * dpi_scale_x
-                    rendered_h = page.rect.height * dpi_scale_y
+                    native_dc_w = page.rect.width * dc_scale_x
+                    native_dc_h = page.rect.height * dc_scale_y
 
-                    scale_w = printable_width / rendered_w if rendered_w > 0 else 1.0
-                    scale_h = printable_height / rendered_h if rendered_h > 0 else 1.0
+                    scale_w = printable_width / native_dc_w if native_dc_w > 0 else 1.0
+                    scale_h = printable_height / native_dc_h if native_dc_h > 0 else 1.0
 
-                    # If width matches printable area (within 5%) but height is much smaller
-                    # (typical for thermal label printers where the driver form height is smaller
-                    # than the actual label stock), DO NOT shrink width to fit height!
+                    # Thermal label printer protection: if width matches within 5%
+                    # but height is much smaller, preserve 1:1 width scale.
                     if scale_w >= 0.95 and scale_h < 0.7:
                         logger.warning(
                             "Printer DC height (%d px) is significantly smaller than document height (%d px), "
                             "but width matches (%.1f%%). Preserving 1:1 scale to avoid shrunken label.",
-                            printable_height, int(rendered_h), scale_w * 100.0,
+                            printable_height, int(native_dc_h), scale_w * 100.0,
                         )
                         fit_scale = min(1.0, scale_w)
-                    elif rendered_w > printable_width or rendered_h > printable_height:
+                    elif native_dc_w > printable_width or native_dc_h > printable_height:
                         fit_scale = min(scale_w, scale_h)
                         logger.info("Page exceeds printable area — shrink-to-fit scale=%.4f", fit_scale)
                     else:
                         fit_scale = 1.0
 
-                    final_scale_x = dpi_scale_x * fit_scale
-                    final_scale_y = dpi_scale_y * fit_scale
+                    # Rasterize at render_dpi (capped by max_render_dpi to prevent
+                    # 90MB+ monolithic GDI allocations on 600 DPI inkjets, Issue #9)
+                    render_scale_x = (render_dpi_x / 72.0) * fit_scale
+                    render_scale_y = (render_dpi_y / 72.0) * fit_scale
 
-                    matrix = fitz.Matrix(final_scale_x, final_scale_y)
+                    matrix = fitz.Matrix(render_scale_x, render_scale_y)
                     pix = page.get_pixmap(matrix=matrix, alpha=False)
 
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     if is_monochrome:
                         img = img.convert("L").convert("RGB")
 
-                    x_offset = max(0, (printable_width - pix.width) // 2)
-                    y_offset = max(0, (printable_height - pix.height) // 2)
+                    # Ensure image width is a multiple of 4 pixels so 24-bit DIB
+                    # scanlines have zero DWORD-alignment padding bytes (Issue #9)
+                    rem = img.width % 4
+                    if rem != 0:
+                        pad_w = 4 - rem
+                        padded = Image.new("RGB", (img.width + pad_w, img.height), (255, 255, 255))
+                        padded.paste(img, (0, 0))
+                        img = padded
 
-                    dib = ImageWin.Dib(img)
-                    dib.draw(
-                        hdc.GetHandleOutput(),
-                        (x_offset, y_offset, x_offset + pix.width, y_offset + pix.height)
-                    )
+                    dst_w = max(4, int(round(native_dc_w * fit_scale)))
+                    dst_h = max(1, int(round(native_dc_h * fit_scale)))
+                    # Align destination width to 4 pixels as well
+                    dst_w = min(printable_width, max(4, dst_w - (dst_w % 4)))
+
+                    x_offset = max(0, (printable_width - dst_w) // 2)
+                    y_offset = max(0, (printable_height - dst_h) // 2)
+
+                    # Draw in horizontal bands (256 rows per StretchDIBits call)
+                    # so GDI EMF records stay ~1.5 MB instead of ~90 MB (Issue #9).
+                    band_height = 256
+                    src_w, src_h = img.size
+                    hdc_out = hdc.GetHandleOutput()
+                    for src_y0 in range(0, src_h, band_height):
+                        src_y1 = min(src_h, src_y0 + band_height)
+                        dst_y0 = y_offset + int(round(src_y0 * dst_h / src_h))
+                        dst_y1 = y_offset + int(round(src_y1 * dst_h / src_h))
+                        if dst_y1 <= dst_y0:
+                            continue
+                        band_img = img.crop((0, src_y0, src_w, src_y1))
+                        band_dib = ImageWin.Dib(band_img)
+                        band_dib.draw(
+                            hdc_out,
+                            (x_offset, dst_y0, x_offset + dst_w, dst_y1),
+                        )
 
                     hdc.EndPage()
 
@@ -794,6 +1126,96 @@ def _encode_additional_value(value_tag: int, value: bytes) -> bytes:
         + struct.pack("!H", 0)     # zero-length name
         + struct.pack("!H", len(value))
         + value
+    )
+
+
+def _encode_beg_collection(name: str = "") -> bytes:
+    """
+    Encode a ``begCollection`` (0x34) tag per RFC 8010 §3.1.6.
+
+    *name* is non-empty for the first value of a collection attribute and empty
+    for additional values in a ``1setOf collection`` or nested collections.
+    """
+    name_bytes = name.encode("ascii") if name else b""
+    return (
+        struct.pack("!B", IPP_TAG_BEG_COLLECTION)
+        + struct.pack("!H", len(name_bytes))
+        + name_bytes
+        + struct.pack("!H", 0)
+    )
+
+
+def _encode_end_collection() -> bytes:
+    """Encode an ``endCollection`` (0x37) tag per RFC 8010 §3.1.6."""
+    return (
+        struct.pack("!B", IPP_TAG_END_COLLECTION)
+        + struct.pack("!H", 0)
+        + struct.pack("!H", 0)
+    )
+
+
+def _encode_member_name(member_name: str) -> bytes:
+    """Encode a ``memberAttrName`` (0x4A) tag inside a collection."""
+    name_bytes = member_name.encode("ascii")
+    return (
+        struct.pack("!B", IPP_TAG_MEMBER_ATTR_NAME)
+        + struct.pack("!H", 0)
+        + struct.pack("!H", len(name_bytes))
+        + name_bytes
+    )
+
+
+def _encode_member_integer(member_name: str, value: int) -> bytes:
+    """Encode a 32-bit integer member attribute inside an IPP collection."""
+    return (
+        _encode_member_name(member_name)
+        + _encode_additional_value(IPP_TAG_INTEGER, struct.pack("!i", value))
+    )
+
+
+def _encode_member_keyword(member_name: str, keyword: str) -> bytes:
+    """Encode a keyword member attribute inside an IPP collection."""
+    return (
+        _encode_member_name(member_name)
+        + _encode_additional_value(IPP_TAG_KEYWORD, keyword.encode("ascii"))
+    )
+
+
+def _encode_media_size_member(w_mm: float, h_mm: float) -> bytes:
+    """Encode a nested ``media-size`` collection member with dimensions in 1/100 mm."""
+    x_dim = int(round(w_mm * 100))
+    y_dim = int(round(h_mm * 100))
+    return (
+        _encode_member_name("media-size")
+        + _encode_beg_collection("")
+        + _encode_member_integer("x-dimension", x_dim)
+        + _encode_member_integer("y-dimension", y_dim)
+        + _encode_end_collection()
+    )
+
+
+def _encode_media_col_entry(
+    attr_name: str,
+    w_mm: float,
+    h_mm: float,
+    margin_hmm: int = 423,
+    media_source: str = "main",
+    media_type: str = "stationery",
+) -> bytes:
+    """
+    Encode a ``media-col`` collection value (used for ``media-col-default``,
+    ``media-col-ready``, and ``media-col-database`` entries).
+    """
+    return (
+        _encode_beg_collection(attr_name)
+        + _encode_media_size_member(w_mm, h_mm)
+        + _encode_member_integer("media-bottom-margin", margin_hmm)
+        + _encode_member_integer("media-left-margin", margin_hmm)
+        + _encode_member_integer("media-right-margin", margin_hmm)
+        + _encode_member_integer("media-top-margin", margin_hmm)
+        + _encode_member_keyword("media-source", media_source)
+        + _encode_member_keyword("media-type", media_type)
+        + _encode_end_collection()
     )
 
 
@@ -1002,7 +1424,7 @@ def extract_ipp_job_attributes(raw: bytes) -> dict[str, str]:
                     attrs["media"] = val
                 else:
                     attrs[effective_name] = val
-            elif tag == IPP_TAG_INTEGER and value_len == 4:
+            elif tag in (IPP_TAG_INTEGER, IPP_TAG_ENUM) and value_len == 4:
                 val_int = struct.unpack("!i", attr_value_raw)[0]
                 attrs[effective_name] = str(val_int)
 
@@ -1069,11 +1491,14 @@ def _build_printer_attributes(
 
     attrs += _encode_text_attribute(IPP_TAG_MIMETYPE, "document-format-default", "application/pdf")
 
-    # Operations supported (Print-Job, Validate-Job, Get-Printer-Attributes, Get-Jobs)
+    # Operations supported (Print-Job, Validate-Job, Cancel-Job,
+    # Get-Job-Attributes, Get-Jobs, Get-Printer-Attributes — Issue #10)
     attrs += _encode_enum_attribute("operations-supported", IPP_OP_PRINT_JOB)
     attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", IPP_OP_VALIDATE_JOB))
-    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", IPP_OP_GET_PRINTER_ATTRIBUTES))
+    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", IPP_OP_CANCEL_JOB))
+    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", IPP_OP_GET_JOB_ATTRIBUTES))
     attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", IPP_OP_GET_JOBS))
+    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", IPP_OP_GET_PRINTER_ATTRIBUTES))
 
     # Charset & language
     attrs += _encode_text_attribute(IPP_TAG_CHARSET, "charset-configured", "utf-8")
@@ -1108,26 +1533,28 @@ def _build_printer_attributes(
     try:
         hprinter = win32print.OpenPrinter(printer_name)
         try:
-            props = win32print.GetPrinter(hprinter, 2)
-            devmode = props["pDevMode"]
-            if devmode.PaperSize == win32con.DMPAPER_A4:
-                default_media = "iso_a4_210x297mm"
-            elif devmode.PaperSize == win32con.DMPAPER_A5:
-                default_media = "iso_a5_148x210mm"
-            elif devmode.PaperSize == win32con.DMPAPER_A6:
-                default_media = "iso_a6_105x148mm"
-            elif devmode.PaperSize == win32con.DMPAPER_LETTER:
-                default_media = "na_letter_8.5x11in"
-            elif devmode.PaperSize == win32con.DMPAPER_LEGAL:
-                default_media = "na_legal_8.5x14in"
-            elif devmode.PaperWidth > 0 and devmode.PaperLength > 0:
-                pw_mm = devmode.PaperWidth / 10.0
-                ph_mm = devmode.PaperLength / 10.0
-                for k, (mw, mh) in IPP_MEDIA_SIZES.items():
-                    if (abs(mw - pw_mm) < 3.0 and abs(mh - ph_mm) < 3.0) or \
-                       (abs(mw - ph_mm) < 3.0 and abs(mh - pw_mm) < 3.0):
-                        default_media = k
-                        break
+            devmode = _get_printer_devmode(hprinter, printer_name)
+            if devmode is not None:
+                if devmode.PaperSize == win32con.DMPAPER_A4:
+                    default_media = "iso_a4_210x297mm"
+                elif devmode.PaperSize == win32con.DMPAPER_A3:
+                    default_media = "iso_a3_297x420mm"
+                elif devmode.PaperSize == win32con.DMPAPER_A5:
+                    default_media = "iso_a5_148x210mm"
+                elif devmode.PaperSize == win32con.DMPAPER_A6:
+                    default_media = "iso_a6_105x148mm"
+                elif devmode.PaperSize == win32con.DMPAPER_LETTER:
+                    default_media = "na_letter_8.5x11in"
+                elif devmode.PaperSize == win32con.DMPAPER_LEGAL:
+                    default_media = "na_legal_8.5x14in"
+                elif devmode.PaperWidth > 0 and devmode.PaperLength > 0:
+                    pw_mm = devmode.PaperWidth / 10.0
+                    ph_mm = devmode.PaperLength / 10.0
+                    for k, (mw, mh) in IPP_MEDIA_SIZES.items():
+                        if (abs(mw - pw_mm) < 3.0 and abs(mh - ph_mm) < 3.0) or \
+                           (abs(mw - ph_mm) < 3.0 and abs(mh - pw_mm) < 3.0):
+                            default_media = k
+                            break
         finally:
             win32print.ClosePrinter(hprinter)
     except Exception:
@@ -1160,16 +1587,61 @@ def _build_printer_attributes(
     for m in unique_media[1:]:
         attrs += _encode_additional_value(IPP_TAG_KEYWORD, m.encode("ascii"))
 
-    # media-ready — iOS 16+ requires this to show the printer.
+    # media-ready — advertise the active loaded paper size (Issue #10).
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-ready", unique_media[0])
-    for m in unique_media[1:]:
-        attrs += _encode_additional_value(IPP_TAG_KEYWORD, m.encode("ascii"))
 
-
-    # media-col-supported — iOS 16+ checks for this collection attribute.
+    # media-col-supported — iOS 16+ & macOS CUPS check for these collection members.
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-col-supported", "media-size")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-top-margin")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-left-margin")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-right-margin")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-bottom-margin")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-type")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-source")
+
+    # Margin, source, and type capabilities required by CUPS _ppdCreateFromIPP (Issue #10)
+    for margin_attr in (
+        "media-bottom-margin-supported",
+        "media-left-margin-supported",
+        "media-right-margin-supported",
+        "media-top-margin-supported",
+    ):
+        attrs += _encode_integer_attribute(margin_attr, 423)
+        attrs += _encode_additional_value(IPP_TAG_INTEGER, struct.pack("!i", 0))
+        attrs += _encode_additional_value(IPP_TAG_INTEGER, struct.pack("!i", 635))
+
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-source-supported", "main")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"auto")
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-type-supported", "stationery")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"auto")
+
+    # media-col-default & media-col-ready (Issue #10 — prevents macOS/CUPS from
+    # failing IPP conformance and falling back to *Letter when printer is A4)
+    def_w_mm, def_h_mm = IPP_MEDIA_SIZES.get(unique_media[0], (210.0, 297.0))
+    attrs += _encode_media_col_entry("media-col-default", def_w_mm, def_h_mm)
+    attrs += _encode_media_col_entry("media-col-ready", def_w_mm, def_h_mm)
+
+    # media-size-supported (1setOf collection of x-dimension / y-dimension)
+    for idx, media_key in enumerate(unique_media):
+        mw, mh = IPP_MEDIA_SIZES.get(media_key, (210.0, 297.0))
+        attrs += _encode_beg_collection("media-size-supported" if idx == 0 else "")
+        attrs += _encode_member_integer("x-dimension", int(round(mw * 100)))
+        attrs += _encode_member_integer("y-dimension", int(round(mh * 100)))
+        attrs += _encode_end_collection()
+
+    # media-col-database (1setOf collection for CUPS driverless PageSize synthesis)
+    for idx, media_key in enumerate(unique_media):
+        mw, mh = IPP_MEDIA_SIZES.get(media_key, (210.0, 297.0))
+        attrs += _encode_media_col_entry(
+            "media-col-database" if idx == 0 else "", mw, mh
+        )
+
+    # Orientation capabilities (3=portrait, 4=landscape, 5=reverse-landscape, 6=reverse-portrait)
+    attrs += _encode_enum_attribute("orientation-requested-default", 3)
+    attrs += _encode_enum_attribute("orientation-requested-supported", 3)
+    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", 4))
+    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", 5))
+    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", 6))
 
     # Sides (duplex) — we report simplex only for safety
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "sides-default", "one-sided")
@@ -1405,6 +1877,17 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         if color_mode:
             logger.info("IPP requested print-color-mode: %s", color_mode)
 
+        # Extract requested orientation-requested (3=portrait, 4=landscape, 5=rev-landscape, 6=rev-portrait)
+        orientation_requested: Optional[int] = None
+        if "orientation-requested" in job_attrs_parsed:
+            try:
+                orientation_requested = int(job_attrs_parsed["orientation-requested"])
+                logger.info("IPP requested orientation-requested: %d", orientation_requested)
+            except (ValueError, TypeError):
+                pass
+
+        job_name = job_attrs_parsed.get("job-name")
+
         doc_data = extract_document_data(raw)
         if not doc_data:
             logger.error("No document data found in Print-Job payload")
@@ -1431,19 +1914,24 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
             tmp_fd.close()
             logger.info("Temp file written: %s", tmp_path)
 
-            # Convert Apple Raster (URF) to PDF — Windows can't print URF natively.
+            # Convert Apple Raster (URF) or PWG Raster to PDF — Windows can't print them natively.
             spool_path = tmp_path
             if ext == ".urf":
                 spool_path = convert_urf_to_pdf(tmp_path)
-                logger.info("Spool path after conversion: %s", spool_path)
+                logger.info("Spool path after URF conversion: %s", spool_path)
+            elif ext == ".pwg":
+                spool_path = convert_pwg_to_pdf(tmp_path)
+                logger.info("Spool path after PWG conversion: %s", spool_path)
 
-            # Spool — pass media size, copies, and color mode
+            # Spool — pass media size, copies, color mode, orientation, and job name
             spool_to_printer(
                 spool_path,
                 self.printer_name,
                 media_size_mm=media_size_mm,
                 copies=copies,
                 color_mode=color_mode,
+                orientation_requested=orientation_requested,
+                job_name=job_name,
             )
 
 
